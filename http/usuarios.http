@@ -1,0 +1,164 @@
+# Serviço de usuarios. Rode na ordem (os logins guardam o token para as próximas).
+# VS Code + extensão REST Client: clique em "Send Request" acima de cada requisição.
+
+@usuarios = http://localhost:3001
+
+### Health: serviço e banco ok (200)
+GET {{usuarios}}/health
+
+### Login do cliente (200) - guarda o token em "login"
+# @name login
+POST {{usuarios}}/auth/login
+Content-Type: application/json
+
+{ "email": "cliente@loja.com", "senha": "cliente123" }
+
+### Login do admin (200) - guarda o token em "loginAdmin"
+# @name loginAdmin
+POST {{usuarios}}/auth/login
+Content-Type: application/json
+
+{ "email": "admin@loja.com", "senha": "admin123" }
+
+### 401 - senha errada
+POST {{usuarios}}/auth/login
+Content-Type: application/json
+
+{ "email": "cliente@loja.com", "senha": "senha-errada" }
+
+### 401 - e-mail que não existe (mesma mensagem da senha errada)
+POST {{usuarios}}/auth/login
+Content-Type: application/json
+
+{ "email": "ninguem@loja.com", "senha": "qualquer123" }
+
+### 400 - login sem senha
+POST {{usuarios}}/auth/login
+Content-Type: application/json
+
+{ "email": "cliente@loja.com" }
+
+### Cadastro (201) - e-mail com timestamp para poder rodar várias vezes; a senha não volta
+POST {{usuarios}}/usuarios
+Content-Type: application/json
+
+{ "nome": "Ana", "email": "ana{{$timestamp}}@loja.com", "senha": "segredo123" }
+
+### Cadastro tentando virar admin (201, mas o perfil volta "cliente")
+POST {{usuarios}}/usuarios
+Content-Type: application/json
+
+{ "nome": "Esperto", "email": "esperto{{$timestamp}}@loja.com", "senha": "segredo123", "perfil": "admin" }
+
+### 409 - e-mail já cadastrado
+POST {{usuarios}}/usuarios
+Content-Type: application/json
+
+{ "nome": "Outro Cliente", "email": "cliente@loja.com", "senha": "segredo123" }
+
+### 400 - dados inválidos (sem e-mail, senha curta)
+POST {{usuarios}}/usuarios
+Content-Type: application/json
+
+{ "nome": "Sem Email", "senha": "123" }
+
+### 400 - JSON quebrado
+POST {{usuarios}}/usuarios
+Content-Type: application/json
+
+{ "nome": "Ana", }
+
+### Meus dados (200) - reaproveita o token do login
+GET {{usuarios}}/usuarios/me
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 401 - sem token
+GET {{usuarios}}/usuarios/me
+
+### 401 - token inválido
+GET {{usuarios}}/usuarios/me
+Authorization: Bearer token-inventado
+
+### Atualizar meus dados (200) - sem "senha", a senha atual é mantida
+PUT {{usuarios}}/usuarios/me
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "nome": "Cliente Atualizado", "email": "cliente@loja.com" }
+
+### 400 - atualizar sem nome
+PUT {{usuarios}}/usuarios/me
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "email": "cliente@loja.com" }
+
+### 409 - trocar para o e-mail do admin
+PUT {{usuarios}}/usuarios/me
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "nome": "Cliente", "email": "admin@loja.com" }
+
+### Meus endereços (200) - o seed já cria um
+GET {{usuarios}}/usuarios/me/enderecos
+Authorization: Bearer {{login.response.body.$.token}}
+
+### Criar endereço (201) - guarda em "novoEndereco"
+# @name novoEndereco
+POST {{usuarios}}/usuarios/me/enderecos
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "apelido": "Trabalho",
+  "cep": "97015-900",
+  "logradouro": "Avenida Roraima",
+  "numero": "1000",
+  "complemento": "Prédio 7",
+  "cidade": "Santa Maria",
+  "uf": "rs"
+}
+
+### 400 - endereço sem cep, cidade e com uf inválida
+POST {{usuarios}}/usuarios/me/enderecos
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "logradouro": "Rua Sem Cidade", "uf": "RSS" }
+
+### 401 - criar endereço sem token
+POST {{usuarios}}/usuarios/me/enderecos
+Content-Type: application/json
+
+{ "cep": "97010-000", "logradouro": "Rua A", "cidade": "Santa Maria", "uf": "RS" }
+
+### 404 - admin tentando apagar o endereço do cliente (não é dele)
+DELETE {{usuarios}}/usuarios/me/enderecos/{{novoEndereco.response.body.$.id}}
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+
+### Remover endereço (204)
+DELETE {{usuarios}}/usuarios/me/enderecos/{{novoEndereco.response.body.$.id}}
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 404 - remover de novo (já não existe)
+DELETE {{usuarios}}/usuarios/me/enderecos/{{novoEndereco.response.body.$.id}}
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 404 - id que nem é UUID
+DELETE {{usuarios}}/usuarios/me/enderecos/abc
+Authorization: Bearer {{login.response.body.$.token}}
+
+### Lista de usuários (200) - admin, sem senha_hash
+GET {{usuarios}}/usuarios
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+
+### 403 - cliente tentando listar usuários
+GET {{usuarios}}/usuarios
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 401 - listar usuários sem token
+GET {{usuarios}}/usuarios
+
+### 404 - rota que não existe
+GET {{usuarios}}/nao-existe

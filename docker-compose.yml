@@ -1,0 +1,59 @@
+services:
+  # ---------- usuarios: Node + Postgres ----------
+  usuarios-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: usuarios
+      POSTGRES_PASSWORD: usuarios
+      POSTGRES_DB: usuarios
+    ports:
+      - "5433:5432" # 5433 no host para não brigar com um Postgres instalado na máquina
+    volumes:
+      - usuarios-dados:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U usuarios -d usuarios"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  usuarios:
+    build: ./usuarios
+    environment:
+      PORT: 3001
+      DATABASE_URL: postgres://usuarios:usuarios@usuarios-db:5432/usuarios
+      JWT_SECRET: ${JWT_SECRET:-troque-este-segredo-em-producao}
+      JWT_EXPIRES_IN: 1h
+    ports:
+      - "3001:3001"
+    depends_on:
+      usuarios-db:
+        condition: service_healthy
+
+  # ---------- catalogo: Node + Mongo ----------
+  catalogo-db:
+    image: mongo:7
+    ports:
+      - "27018:27017" # 27018 no host para não brigar com um Mongo instalado na máquina
+    volumes:
+      - catalogo-dados:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  catalogo:
+    build: ./catalogo
+    environment:
+      PORT: 3002
+      MONGO_URL: mongodb://catalogo-db:27017
+      MONGO_DB: catalogo
+    ports:
+      - "3002:3002"
+    depends_on:
+      catalogo-db:
+        condition: service_healthy
+
+volumes:
+  usuarios-dados:
+  catalogo-dados:

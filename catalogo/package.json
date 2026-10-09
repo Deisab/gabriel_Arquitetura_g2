@@ -1,0 +1,19 @@
+{
+  "name": "catalogo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Serviço de catálogo do e-commerce: produtos, categorias e estoque",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "seed": "node seeds/seed.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "mongodb": "^6.10.0"
+  }
+}

@@ -1,0 +1,161 @@
+# Serviço de catalogo. Rode na ordem (algumas requisições reaproveitam ids das anteriores).
+# Rotas de admin ainda estão abertas: o gateway passa a exigir token na próxima aula.
+
+@catalogo = http://localhost:3002
+
+### Health: serviço e banco ok (200)
+GET {{catalogo}}/health
+
+### Lista de categorias (200)
+GET {{catalogo}}/categorias
+
+### Criar categoria (201) - slug gerado a partir do nome
+POST {{catalogo}}/categorias
+Content-Type: application/json
+
+{ "nome": "Eletrônicos {{$timestamp}}" }
+
+### 409 - slug já existe
+POST {{catalogo}}/categorias
+Content-Type: application/json
+
+{ "nome": "Livros de novo", "slug": "livros" }
+
+### 400 - categoria sem nome
+POST {{catalogo}}/categorias
+Content-Type: application/json
+
+{ }
+
+### Lista de produtos ativos (200) - guarda em "lista"
+# @name lista
+GET {{catalogo}}/produtos
+
+### Filtro por categoria (200)
+GET {{catalogo}}/produtos?categoria=livros
+
+### Busca por nome (200)
+GET {{catalogo}}/produtos?categoria=livros&busca=java
+
+### Busca sem resultado (200, lista vazia)
+GET {{catalogo}}/produtos?busca=nao-tem-isso
+
+### Um produto (200) - o primeiro da lista
+GET {{catalogo}}/produtos/{{lista.response.body.$[0].id}}
+
+### 404 - id válido que não existe
+GET {{catalogo}}/produtos/000000000000000000000000
+
+### 404 - id que nem é ObjectId
+GET {{catalogo}}/produtos/id-que-nao-existe
+
+### Criar produto (201) - SKU com timestamp para poder rodar várias vezes; guarda em "novo"
+# @name novo
+POST {{catalogo}}/produtos
+Content-Type: application/json
+
+{
+  "sku": "LIV-{{$timestamp}}",
+  "nome": "Padrões de Projeto",
+  "categoria": "livros",
+  "preco": 129.9,
+  "atributos": { "autor": "Gamma, Helm, Johnson, Vlissides", "paginas": 364 },
+  "estoque": { "disponivel": 7 }
+}
+
+### 409 - SKU já existe
+POST {{catalogo}}/produtos
+Content-Type: application/json
+
+{
+  "sku": "CEL-001",
+  "nome": "Smartphone X repetido",
+  "categoria": "celulares",
+  "preco": 2499.9,
+  "atributos": { "memoria": "128GB", "cor": "preto" }
+}
+
+### 400 - dados inválidos (sem sku, preço negativo)
+POST {{catalogo}}/produtos
+Content-Type: application/json
+
+{ "nome": "Produto ruim", "categoria": "roupas", "preco": -10 }
+
+### 400 - categoria que não existe
+POST {{catalogo}}/produtos
+Content-Type: application/json
+
+{ "sku": "XYZ-001", "nome": "Sem categoria", "categoria": "brinquedos", "preco": 10 }
+
+### Substituir produto (200) - PUT manda o produto inteiro; o estoque não muda aqui
+PUT {{catalogo}}/produtos/{{novo.response.body.$.id}}
+Content-Type: application/json
+
+{
+  "sku": "{{novo.response.body.$.sku}}",
+  "nome": "Padrões de Projeto (edição revisada)",
+  "categoria": "livros",
+  "preco": 139.9,
+  "ativo": true,
+  "atributos": { "autor": "Gamma, Helm, Johnson, Vlissides", "paginas": 364, "edicao": 2 }
+}
+
+### 400 - PUT sem preço
+PUT {{catalogo}}/produtos/{{novo.response.body.$.id}}
+Content-Type: application/json
+
+{ "sku": "{{novo.response.body.$.sku}}", "nome": "Sem preço", "categoria": "livros" }
+
+### 409 - PUT para um SKU de outro produto
+PUT {{catalogo}}/produtos/{{novo.response.body.$.id}}
+Content-Type: application/json
+
+{ "sku": "CEL-001", "nome": "Conflito", "categoria": "livros", "preco": 10 }
+
+### 404 - PUT em produto que não existe
+PUT {{catalogo}}/produtos/000000000000000000000000
+Content-Type: application/json
+
+{ "sku": "NADA-001", "nome": "Nada", "categoria": "livros", "preco": 10 }
+
+### Definir estoque (200) - { "disponivel": n } troca o valor
+PATCH {{catalogo}}/produtos/{{novo.response.body.$.id}}/estoque
+Content-Type: application/json
+
+{ "disponivel": 20 }
+
+### Ajustar estoque (200) - { "ajuste": n } soma ou subtrai
+PATCH {{catalogo}}/produtos/{{novo.response.body.$.id}}/estoque
+Content-Type: application/json
+
+{ "ajuste": -5 }
+
+### 400 - ajuste que deixaria o estoque negativo
+PATCH {{catalogo}}/produtos/{{novo.response.body.$.id}}/estoque
+Content-Type: application/json
+
+{ "ajuste": -1000 }
+
+### 400 - estoque negativo direto
+PATCH {{catalogo}}/produtos/{{novo.response.body.$.id}}/estoque
+Content-Type: application/json
+
+{ "disponivel": -1 }
+
+### 404 - estoque de produto que não existe
+PATCH {{catalogo}}/produtos/000000000000000000000000/estoque
+Content-Type: application/json
+
+{ "ajuste": 1 }
+
+### Desativar produto (204) - não apaga, só ativo = false
+DELETE {{catalogo}}/produtos/{{novo.response.body.$.id}}
+
+### O produto ainda existe, com ativo: false (200)
+GET {{catalogo}}/produtos/{{novo.response.body.$.id}}
+
+### 404 - desativar produto que não existe
+DELETE {{catalogo}}/produtos/000000000000000000000000
+
+### 404 - rota que não existe
+GET {{catalogo}}/nao-existe
