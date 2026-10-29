@@ -88,6 +88,34 @@ services:
       catalogo-db:
         condition: service_healthy
 
+  # ---------- pedidos: Node + Postgres (o seu próprio banco) ----------
+  pedidos-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pedidos
+      POSTGRES_PASSWORD: pedidos
+      POSTGRES_DB: pedidos
+    volumes:
+      - pedidos-dados:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pedidos -d pedidos"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  pedidos:
+    build: ./pedidos
+    environment:
+      PORT: 3003
+      DATABASE_URL: postgres://pedidos:pedidos@pedidos-db:5432/pedidos
+      # chamada direta pela rede interna, sem passar pelo gateway
+      CATALOGO_URL: http://catalogo:3002
+      CATALOGO_TIMEOUT_MS: 3000
+    depends_on:
+      pedidos-db:
+        condition: service_healthy
+
 volumes:
   usuarios-dados:
   catalogo-dados:
+  pedidos-dados:
