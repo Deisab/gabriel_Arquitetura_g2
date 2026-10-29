@@ -1,6 +1,7 @@
 const express = require('express');
 const { categorias } = require('../db');
 const { ErroHttp } = require('../erros');
+const { exigirAdmin } = require('../acesso');
 const { paraJson } = require('../json');
 const { validarCategoria } = require('../validacao');
 
@@ -12,7 +13,7 @@ router.get('/categorias', async (req, res) => {
 });
 
 // slug é opcional: se não vier, é gerado a partir do nome.
-router.post('/categorias', async (req, res) => {
+router.post('/categorias', exigirAdmin, async (req, res) => {
   const categoria = validarCategoria(req.body ?? {});
 
   try {

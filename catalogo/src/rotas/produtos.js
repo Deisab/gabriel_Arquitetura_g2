@@ -1,12 +1,15 @@
 const express = require('express');
+const { ObjectId } = require('mongodb');
 const { produtos, categorias } = require('../db');
 const { ErroHttp } = require('../erros');
 const { paraJson } = require('../json');
+const { exigirAdmin } = require('../acesso');
 const { idDoProduto, validarProduto } = require('../validacao');
 
-// Rotas de admin, por enquanto, ficam abertas: validar o token é trabalho do gateway (próxima aula).
+// GET é público; o resto é de admin. O gateway confere o token e o perfil (jwt + acl) antes de chegar aqui.
 const router = express.Router();
 
+const OBJECT_ID = /^[0-9a-f]{24}$/i;
 const escaparRegex = (valor) => valor.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 async function exigirCategoria(slug) {
@@ -20,7 +23,17 @@ function skuDuplicado(err) {
 }
 
 // GET /produtos?categoria=livros&busca=java  -> só produtos ativos
+// GET /produtos?ids=a,b,c                    -> esses produtos, ativos ou não (usado pelo pedidos no checkout)
 router.get('/produtos', async (req, res) => {
+  if (typeof req.query.ids === 'string') {
+    const ids = [...new Set(req.query.ids.split(',').map((id) => id.trim()).filter(Boolean))];
+    if (ids.length > 100) throw new ErroHttp(400, 'Dados inválidos.', ['envie no máximo 100 ids']);
+    // id que não é ObjectId não existe: só fica de fora da resposta.
+    const validos = ids.filter((id) => OBJECT_ID.test(id)).map((id) => new ObjectId(id));
+    const lista = await produtos().find({ _id: { $in: validos } }).toArray();
+    return res.json(lista.map(paraJson));
+  }
+
   const filtro = { ativo: true };
   const categoria = typeof req.query.categoria === 'string' ? req.query.categoria.trim().toLowerCase() : '';
   const busca = typeof req.query.busca === 'string' ? req.query.busca.trim() : '';
@@ -39,7 +52,7 @@ router.get('/produtos/:id', async (req, res) => {
   res.json(paraJson(produto));
 });
 
-router.post('/produtos', async (req, res) => {
+router.post('/produtos', exigirAdmin, async (req, res) => {
   const produto = validarProduto(req.body ?? {}, { criando: true });
   await exigirCategoria(produto.categoria);
 
@@ -51,7 +64,7 @@ router.post('/produtos', async (req, res) => {
   }
 });
 
-router.put('/produtos/:id', async (req, res) => {
+router.put('/produtos/:id', exigirAdmin, async (req, res) => {
   const _id = idDoProduto(req.params.id);
   const dados = validarProduto(req.body ?? {}, { criando: false });
   await exigirCategoria(dados.categoria);
@@ -66,7 +79,7 @@ router.put('/produtos/:id', async (req, res) => {
 });
 
 // Corpo: { "disponivel": 15 } define o valor, ou { "ajuste": -3 } soma/subtrai.
-router.patch('/produtos/:id/estoque', async (req, res) => {
+router.patch('/produtos/:id/estoque', exigirAdmin, async (req, res) => {
   const _id = idDoProduto(req.params.id);
   const corpo = req.body ?? {};
   const temDisponivel = corpo.disponivel !== undefined;
@@ -102,7 +115,7 @@ router.patch('/produtos/:id/estoque', async (req, res) => {
 });
 
 // Não apaga: desativa (ativo = false). Pedidos antigos continuam apontando para o produto.
-router.delete('/produtos/:id', async (req, res) => {
+router.delete('/produtos/:id', exigirAdmin, async (req, res) => {
   const { matchedCount } = await produtos().updateOne({ _id: idDoProduto(req.params.id) }, { $set: { ativo: false } });
   if (matchedCount === 0) throw new ErroHttp(404, 'Produto não encontrado.');
   res.status(204).end();

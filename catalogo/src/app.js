@@ -6,6 +6,14 @@ const app = express();
 app.disable('x-powered-by');
 app.use(express.json());
 
+// Uma linha por requisição, com o X-Request-Id que o gateway gerou: um grep acha a história inteira.
+app.use((req, res, next) => {
+  res.on('finish', () => {
+    console.log(`${req.method} ${req.originalUrl} ${res.statusCode} | x-request-id=${req.get('x-request-id') ?? '-'}`);
+  });
+  next();
+});
+
 app.get('/health', async (req, res) => {
   try {
     await ping();

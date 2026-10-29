@@ -1,29 +1,30 @@
 const jwt = require('jsonwebtoken');
 const { ErroHttp } = require('./erros');
 
+// usuarios é o único serviço que emite JWT. O perfil vem do banco, no login.
+// O Kong usa o campo perfil para achar o consumer (cliente ou admin) e decidir as rotas de admin.
 function gerarToken(usuario) {
   return jwt.sign(
-    { id: usuario.id, email: usuario.email, perfil: usuario.perfil },
+    { sub: usuario.id, email: usuario.email, perfil: usuario.perfil },
     process.env.JWT_SECRET,
-    { algorithm: 'HS256', expiresIn: process.env.JWT_EXPIRES_IN || '1h' },
+    { algorithm: 'HS256', expiresIn: process.env.JWT_EXPIRES_IN || '2h', issuer: 'usuarios' },
   );
 }
 
-// Por enquanto o próprio serviço valida o token; na próxima aula o gateway assume.
+// Quem valida o token é o gateway. O serviço confia nos X-User-* que o Kong injeta,
+// porque só o gateway alcança o serviço (nenhuma porta publicada).
+// Se o cabeçalho não veio, a requisição não passou pelo jwt do gateway: 401.
 function autenticar(req, res, next) {
-  const [tipo, token] = (req.get('authorization') || '').split(' ');
-  if (tipo !== 'Bearer' || !token) {
-    return next(new ErroHttp(401, 'Token ausente. Envie o cabeçalho Authorization: Bearer <token>.'));
+  const id = req.get('x-user-id');
+  if (!id) {
+    return next(new ErroHttp(401, 'Faça login. Envie o cabeçalho Authorization: Bearer <token>.'));
   }
 
-  try {
-    req.usuario = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
-    next();
-  } catch {
-    next(new ErroHttp(401, 'Token inválido ou expirado.'));
-  }
+  req.usuario = { id, email: req.get('x-user-email'), perfil: req.get('x-user-role') };
+  next();
 }
 
+// O 403 de verdade é do acl no Kong; aqui é só a segunda linha de defesa.
 function exigirAdmin(req, res, next) {
   if (req.usuario.perfil !== 'admin') {
     return next(new ErroHttp(403, 'Acesso restrito a administradores.'));
