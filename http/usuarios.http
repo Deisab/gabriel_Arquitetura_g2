@@ -1,112 +1,123 @@
-# Serviço de usuarios. Rode na ordem (os logins guardam o token para as próximas).
+# Serviço de usuarios, sempre pelo gateway (Kong). Rode na ordem (os logins guardam o token para as próximas).
 # VS Code + extensão REST Client: clique em "Send Request" acima de cada requisição.
+# Toda resposta traz X-Request-Id (plugin correlation-id): é o id para procurar nos logs dos serviços.
 
-@usuarios = http://localhost:3001
+@baseUrl = http://localhost:8080
 
-### Health: serviço e banco ok (200)
-GET {{usuarios}}/health
+### Health: serviço e banco ok (200) - no gateway é /health/usuarios
+GET {{baseUrl}}/health/usuarios
 
 ### Login do cliente (200) - guarda o token em "login"
 # @name login
-POST {{usuarios}}/auth/login
+POST {{baseUrl}}/auth/login
 Content-Type: application/json
 
 { "email": "cliente@loja.com", "senha": "cliente123" }
 
 ### Login do admin (200) - guarda o token em "loginAdmin"
 # @name loginAdmin
-POST {{usuarios}}/auth/login
+POST {{baseUrl}}/auth/login
 Content-Type: application/json
 
 { "email": "admin@loja.com", "senha": "admin123" }
 
 ### 401 - senha errada
-POST {{usuarios}}/auth/login
+POST {{baseUrl}}/auth/login
 Content-Type: application/json
 
 { "email": "cliente@loja.com", "senha": "senha-errada" }
 
 ### 401 - e-mail que não existe (mesma mensagem da senha errada)
-POST {{usuarios}}/auth/login
+POST {{baseUrl}}/auth/login
 Content-Type: application/json
 
 { "email": "ninguem@loja.com", "senha": "qualquer123" }
 
 ### 400 - login sem senha
-POST {{usuarios}}/auth/login
+POST {{baseUrl}}/auth/login
 Content-Type: application/json
 
 { "email": "cliente@loja.com" }
 
 ### Cadastro (201) - e-mail com timestamp para poder rodar várias vezes; a senha não volta
-POST {{usuarios}}/usuarios
+POST {{baseUrl}}/usuarios
 Content-Type: application/json
 
 { "nome": "Ana", "email": "ana{{$timestamp}}@loja.com", "senha": "segredo123" }
 
 ### Cadastro tentando virar admin (201, mas o perfil volta "cliente")
-POST {{usuarios}}/usuarios
+POST {{baseUrl}}/usuarios
 Content-Type: application/json
 
 { "nome": "Esperto", "email": "esperto{{$timestamp}}@loja.com", "senha": "segredo123", "perfil": "admin" }
 
 ### 409 - e-mail já cadastrado
-POST {{usuarios}}/usuarios
+POST {{baseUrl}}/usuarios
 Content-Type: application/json
 
 { "nome": "Outro Cliente", "email": "cliente@loja.com", "senha": "segredo123" }
 
 ### 400 - dados inválidos (sem e-mail, senha curta)
-POST {{usuarios}}/usuarios
+POST {{baseUrl}}/usuarios
 Content-Type: application/json
 
 { "nome": "Sem Email", "senha": "123" }
 
 ### 400 - JSON quebrado
-POST {{usuarios}}/usuarios
+POST {{baseUrl}}/usuarios
 Content-Type: application/json
 
 { "nome": "Ana", }
 
 ### Meus dados (200) - reaproveita o token do login
-GET {{usuarios}}/usuarios/me
+GET {{baseUrl}}/usuarios/me
 Authorization: Bearer {{login.response.body.$.token}}
 
-### 401 - sem token
-GET {{usuarios}}/usuarios/me
+### 401 - sem token (quem responde é o Kong: o serviço nem fica sabendo)
+GET {{baseUrl}}/usuarios/me
 
-### 401 - token inválido
-GET {{usuarios}}/usuarios/me
+### 401 - token inválido (Kong: "Bad token; invalid JSON")
+GET {{baseUrl}}/usuarios/me
 Authorization: Bearer token-inventado
 
+### 401 - tentar se passar por alguém com X-User-Id, sem token (o Kong apaga os X-User-* de fora)
+GET {{baseUrl}}/usuarios/me
+X-User-Id: 00000000-0000-0000-0000-000000000000
+X-User-Role: admin
+
+### Meus dados mandando X-User-Id falso junto do token (200, mas com os dados do token, não do cabeçalho)
+GET {{baseUrl}}/usuarios/me
+Authorization: Bearer {{login.response.body.$.token}}
+X-User-Id: 00000000-0000-0000-0000-000000000000
+
 ### Atualizar meus dados (200) - sem "senha", a senha atual é mantida
-PUT {{usuarios}}/usuarios/me
+PUT {{baseUrl}}/usuarios/me
 Authorization: Bearer {{login.response.body.$.token}}
 Content-Type: application/json
 
 { "nome": "Cliente Atualizado", "email": "cliente@loja.com" }
 
 ### 400 - atualizar sem nome
-PUT {{usuarios}}/usuarios/me
+PUT {{baseUrl}}/usuarios/me
 Authorization: Bearer {{login.response.body.$.token}}
 Content-Type: application/json
 
 { "email": "cliente@loja.com" }
 
 ### 409 - trocar para o e-mail do admin
-PUT {{usuarios}}/usuarios/me
+PUT {{baseUrl}}/usuarios/me
 Authorization: Bearer {{login.response.body.$.token}}
 Content-Type: application/json
 
 { "nome": "Cliente", "email": "admin@loja.com" }
 
 ### Meus endereços (200) - o seed já cria um
-GET {{usuarios}}/usuarios/me/enderecos
+GET {{baseUrl}}/usuarios/me/enderecos
 Authorization: Bearer {{login.response.body.$.token}}
 
 ### Criar endereço (201) - guarda em "novoEndereco"
 # @name novoEndereco
-POST {{usuarios}}/usuarios/me/enderecos
+POST {{baseUrl}}/usuarios/me/enderecos
 Authorization: Bearer {{login.response.body.$.token}}
 Content-Type: application/json
 
@@ -121,44 +132,60 @@ Content-Type: application/json
 }
 
 ### 400 - endereço sem cep, cidade e com uf inválida
-POST {{usuarios}}/usuarios/me/enderecos
+POST {{baseUrl}}/usuarios/me/enderecos
 Authorization: Bearer {{login.response.body.$.token}}
 Content-Type: application/json
 
 { "logradouro": "Rua Sem Cidade", "uf": "RSS" }
 
 ### 401 - criar endereço sem token
-POST {{usuarios}}/usuarios/me/enderecos
+POST {{baseUrl}}/usuarios/me/enderecos
 Content-Type: application/json
 
 { "cep": "97010-000", "logradouro": "Rua A", "cidade": "Santa Maria", "uf": "RS" }
 
 ### 404 - admin tentando apagar o endereço do cliente (não é dele)
-DELETE {{usuarios}}/usuarios/me/enderecos/{{novoEndereco.response.body.$.id}}
+DELETE {{baseUrl}}/usuarios/me/enderecos/{{novoEndereco.response.body.$.id}}
 Authorization: Bearer {{loginAdmin.response.body.$.token}}
 
 ### Remover endereço (204)
-DELETE {{usuarios}}/usuarios/me/enderecos/{{novoEndereco.response.body.$.id}}
+DELETE {{baseUrl}}/usuarios/me/enderecos/{{novoEndereco.response.body.$.id}}
 Authorization: Bearer {{login.response.body.$.token}}
 
 ### 404 - remover de novo (já não existe)
-DELETE {{usuarios}}/usuarios/me/enderecos/{{novoEndereco.response.body.$.id}}
+DELETE {{baseUrl}}/usuarios/me/enderecos/{{novoEndereco.response.body.$.id}}
 Authorization: Bearer {{login.response.body.$.token}}
 
 ### 404 - id que nem é UUID
-DELETE {{usuarios}}/usuarios/me/enderecos/abc
+DELETE {{baseUrl}}/usuarios/me/enderecos/abc
 Authorization: Bearer {{login.response.body.$.token}}
 
 ### Lista de usuários (200) - admin, sem senha_hash
-GET {{usuarios}}/usuarios
+GET {{baseUrl}}/usuarios
 Authorization: Bearer {{loginAdmin.response.body.$.token}}
 
 ### 403 - cliente tentando listar usuários
-GET {{usuarios}}/usuarios
+GET {{baseUrl}}/usuarios
 Authorization: Bearer {{login.response.body.$.token}}
 
 ### 401 - listar usuários sem token
-GET {{usuarios}}/usuarios
+GET {{baseUrl}}/usuarios
 
-### 404 - rota que não existe
-GET {{usuarios}}/nao-existe
+### 401 - tentar se passar por admin só com o cabeçalho (sem token)
+GET {{baseUrl}}/usuarios
+X-User-Role: admin
+
+### 401 - token com assinatura falsa: payload { "perfil": "admin" } assinado com outro segredo (Kong: "Invalid signature")
+GET {{baseUrl}}/usuarios
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDAiLCJlbWFpbCI6ImhhY2tlckBsb2phLmNvbSIsInBlcmZpbCI6ImFkbWluIiwiZXhwIjo0MTAyNDQ0ODAwfQ.c2Vnd25kby1lcnJhZG8tYXNzaW5hdHVyYS1mYWxzYQ
+
+### 404 - rota que não existe (o Kong responde: nenhuma route casa)
+GET {{baseUrl}}/nao-existe
+
+### Rate limiting no login: 10 por minuto por IP.
+# Rode esta requisição várias vezes seguidas: a resposta traz X-RateLimit-Remaining-Minute
+# e, depois da 10ª no mesmo minuto, o Kong responde 429 { "message": "API rate limit exceeded" }.
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{ "email": "cliente@loja.com", "senha": "senha-errada" }

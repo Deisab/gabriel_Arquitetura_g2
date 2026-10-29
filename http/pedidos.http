@@ -1,0 +1,214 @@
+# Serviço de pedidos (carrinho e checkout), sempre pelo gateway (Kong). Rode na ordem.
+# Todas as rotas são "logado": o Kong exige o token (jwt) e entrega ao serviço X-User-Id, X-User-Email e X-User-Role.
+# Fluxo: login -> adicionar ao carrinho -> ver carrinho -> checkout (202) -> consultar o pedido.
+
+@baseUrl = http://localhost:8080
+
+### Login do cliente (200) - guarda o token em "login"
+# @name login
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{ "email": "cliente@loja.com", "senha": "cliente123" }
+
+### Login do admin (200) - outro usuário, para os casos de "pedido de outra pessoa"
+# @name loginAdmin
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{ "email": "admin@loja.com", "senha": "admin123" }
+
+### Health: serviço e banco ok (200) - no gateway é /health/pedidos
+GET {{baseUrl}}/health/pedidos
+
+### Livros do catálogo (200, público) - guarda em "livros" para pegar os ids
+# @name livros
+GET {{baseUrl}}/produtos?categoria=livros
+
+# ---------- carrinho ----------
+
+### 401 - carrinho sem token (o Kong responde; o pedidos nem fica sabendo)
+GET {{baseUrl}}/carrinho
+
+### 401 - tentar ver o carrinho de alguém mandando X-User-Id (o Kong apaga os X-User-* de fora)
+GET {{baseUrl}}/carrinho
+X-User-Id: 00000000-0000-0000-0000-000000000000
+
+### Carrinho (200) - começa vazio: { itens: [], total: 0 }
+GET {{baseUrl}}/carrinho
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 400 - checkout com carrinho vazio
+POST {{baseUrl}}/pedidos
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "endereco_entrega": { "cep": "97010-000", "logradouro": "Rua do Acampamento", "numero": "100", "cidade": "Santa Maria", "uf": "RS" },
+  "forma_pagamento": "pix"
+}
+
+### Adicionar ao carrinho (201) - o pedidos pergunta ao catálogo se o produto existe
+POST {{baseUrl}}/carrinho/itens
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "produto_id": "{{livros.response.body.$[0].id}}", "quantidade": 2 }
+
+### Adicionar o mesmo produto de novo (201) - soma: quantidade vira 3
+POST {{baseUrl}}/carrinho/itens
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "produto_id": "{{livros.response.body.$[0].id}}", "quantidade": 1 }
+
+### Adicionar outro produto (201)
+POST {{baseUrl}}/carrinho/itens
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "produto_id": "{{livros.response.body.$[1].id}}", "quantidade": 1 }
+
+### 400 - quantidade inválida
+POST {{baseUrl}}/carrinho/itens
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "produto_id": "{{livros.response.body.$[0].id}}", "quantidade": 0 }
+
+### 404 - produto que não existe no catálogo
+POST {{baseUrl}}/carrinho/itens
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "produto_id": "000000000000000000000000", "quantidade": 1 }
+
+### Ver carrinho (200) - { itens, total } com os preços atuais do catálogo
+GET {{baseUrl}}/carrinho
+Authorization: Bearer {{login.response.body.$.token}}
+
+### Remover item (204)
+DELETE {{baseUrl}}/carrinho/itens/{{livros.response.body.$[1].id}}
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 404 - remover de novo (não está mais no carrinho)
+DELETE {{baseUrl}}/carrinho/itens/{{livros.response.body.$[1].id}}
+Authorization: Bearer {{login.response.body.$.token}}
+
+# ---------- produto indisponível (409) ----------
+
+### Busca o Smartphone Fold (só 2 em estoque no seed) - guarda em "fold"
+# @name fold
+GET {{baseUrl}}/produtos?busca=fold
+
+### Coloca 5 Folds no carrinho (201) - o carrinho aceita; quem confere o estoque é o checkout
+POST {{baseUrl}}/carrinho/itens
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "produto_id": "{{fold.response.body.$[0].id}}", "quantidade": 5 }
+
+### 409 - checkout com produto sem estoque suficiente (detalhes diz qual)
+POST {{baseUrl}}/pedidos
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "endereco_entrega": { "cep": "97010-000", "logradouro": "Rua do Acampamento", "numero": "100", "cidade": "Santa Maria", "uf": "RS" },
+  "forma_pagamento": "pix"
+}
+
+### Tira o Fold do carrinho (204)
+DELETE {{baseUrl}}/carrinho/itens/{{fold.response.body.$[0].id}}
+Authorization: Bearer {{login.response.body.$.token}}
+
+# ---------- checkout ----------
+
+### 400 - checkout com dados inválidos (sem endereço, cartão curto)
+POST {{baseUrl}}/pedidos
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "forma_pagamento": "cartao", "cartao": { "numero": "1234" } }
+
+### Checkout (202) - pedido aceito em AGUARDANDO_ESTOQUE; do cartão só ficam os 4 últimos dígitos
+# @name pedido
+POST {{baseUrl}}/pedidos
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "endereco_entrega": { "cep": "97010-000", "logradouro": "Rua do Acampamento", "numero": "100", "cidade": "Santa Maria", "uf": "RS" },
+  "forma_pagamento": "cartao",
+  "cartao": { "numero": "4111 1111 1111 1111" }
+}
+
+### Carrinho depois do checkout (200, vazio)
+GET {{baseUrl}}/carrinho
+Authorization: Bearer {{login.response.body.$.token}}
+
+### Meus pedidos (200)
+GET {{baseUrl}}/pedidos
+Authorization: Bearer {{login.response.body.$.token}}
+
+### Consultar o pedido (200) - com itens, preço e nome copiados do catálogo na hora da compra
+GET {{baseUrl}}/pedidos/{{pedido.response.body.$.id}}
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 404 - pedido de outro usuário (o admin tentando ver o pedido do cliente; 404 e não 403: não confirma que existe)
+GET {{baseUrl}}/pedidos/{{pedido.response.body.$.id}}
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+
+### 404 - pedido que não existe
+GET {{baseUrl}}/pedidos/00000000-0000-0000-0000-000000000000
+Authorization: Bearer {{login.response.body.$.token}}
+
+# ---------- cancelar ----------
+
+### 404 - cancelar o pedido de outro usuário
+POST {{baseUrl}}/pedidos/{{pedido.response.body.$.id}}/cancelar
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+
+### Cancelar o pedido (200)
+POST {{baseUrl}}/pedidos/{{pedido.response.body.$.id}}/cancelar
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 409 - cancelar de novo (status CANCELADO não permite)
+POST {{baseUrl}}/pedidos/{{pedido.response.body.$.id}}/cancelar
+Authorization: Bearer {{login.response.body.$.token}}
+
+# ---------- catálogo fora do ar (503) ----------
+# 1. Rode a requisição abaixo para deixar um item no carrinho.
+# 2. No terminal: docker compose stop catalogo
+# 3. Rode as três seguintes: o checkout responde 503 (timeout de 3 s ou conexão recusada),
+#    mas o carrinho e a lista de pedidos continuam funcionando.
+# 4. No terminal: docker compose start catalogo
+
+### Deixa um item no carrinho (201) - com o catálogo no ar
+POST {{baseUrl}}/carrinho/itens
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "produto_id": "{{livros.response.body.$[0].id}}", "quantidade": 1 }
+
+### 503 - checkout com o catálogo parado
+POST {{baseUrl}}/pedidos
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "endereco_entrega": { "cep": "97010-000", "logradouro": "Rua do Acampamento", "numero": "100", "cidade": "Santa Maria", "uf": "RS" },
+  "forma_pagamento": "boleto"
+}
+
+### Carrinho com o catálogo parado (200, sem preços e com "aviso")
+GET {{baseUrl}}/carrinho
+Authorization: Bearer {{login.response.body.$.token}}
+
+### Meus pedidos com o catálogo parado (200)
+GET {{baseUrl}}/pedidos
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 404 - rota que não existe (o Kong responde)
+GET {{baseUrl}}/pagamentos
+Authorization: Bearer {{login.response.body.$.token}}

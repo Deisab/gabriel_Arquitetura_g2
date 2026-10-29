@@ -1,57 +1,88 @@
-# Serviço de catalogo. Rode na ordem (algumas requisições reaproveitam ids das anteriores).
-# Rotas de admin ainda estão abertas: o gateway passa a exigir token na próxima aula.
+# Serviço de catalogo, sempre pelo gateway (Kong). Rode na ordem (algumas requisições reaproveitam ids das anteriores).
+# GET é público. POST, PUT, PATCH e DELETE são de admin: jwt + acl no Kong (401 sem token, 403 perfil cliente).
 
-@catalogo = http://localhost:3002
+@baseUrl = http://localhost:8080
 
-### Health: serviço e banco ok (200)
-GET {{catalogo}}/health
+### Login do admin (200) - guarda o token em "loginAdmin"
+# @name loginAdmin
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{ "email": "admin@loja.com", "senha": "admin123" }
+
+### Login do cliente (200) - guarda o token em "login"
+# @name login
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{ "email": "cliente@loja.com", "senha": "cliente123" }
+
+### Health: serviço e banco ok (200) - no gateway é /health/catalogo
+GET {{baseUrl}}/health/catalogo
 
 ### Lista de categorias (200)
-GET {{catalogo}}/categorias
+GET {{baseUrl}}/categorias
+
+### 401 - criar categoria sem token (o Kong responde; o catálogo nem fica sabendo)
+POST {{baseUrl}}/categorias
+Content-Type: application/json
+
+{ "nome": "Sem token" }
+
+### 403 - cliente criando categoria (jwt ok, mas o acl só deixa o grupo admin)
+POST {{baseUrl}}/categorias
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "nome": "Cliente não pode" }
 
 ### Criar categoria (201) - slug gerado a partir do nome
-POST {{catalogo}}/categorias
+POST {{baseUrl}}/categorias
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
 Content-Type: application/json
 
 { "nome": "Eletrônicos {{$timestamp}}" }
 
 ### 409 - slug já existe
-POST {{catalogo}}/categorias
+POST {{baseUrl}}/categorias
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
 Content-Type: application/json
 
 { "nome": "Livros de novo", "slug": "livros" }
 
 ### 400 - categoria sem nome
-POST {{catalogo}}/categorias
+POST {{baseUrl}}/categorias
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
 Content-Type: application/json
 
 { }
 
 ### Lista de produtos ativos (200) - guarda em "lista"
 # @name lista
-GET {{catalogo}}/produtos
+GET {{baseUrl}}/produtos
 
 ### Filtro por categoria (200)
-GET {{catalogo}}/produtos?categoria=livros
+GET {{baseUrl}}/produtos?categoria=livros
 
 ### Busca por nome (200)
-GET {{catalogo}}/produtos?categoria=livros&busca=java
+GET {{baseUrl}}/produtos?categoria=livros&busca=java
 
 ### Busca sem resultado (200, lista vazia)
-GET {{catalogo}}/produtos?busca=nao-tem-isso
+GET {{baseUrl}}/produtos?busca=nao-tem-isso
 
 ### Um produto (200) - o primeiro da lista
-GET {{catalogo}}/produtos/{{lista.response.body.$[0].id}}
+GET {{baseUrl}}/produtos/{{lista.response.body.$[0].id}}
 
 ### 404 - id válido que não existe
-GET {{catalogo}}/produtos/000000000000000000000000
+GET {{baseUrl}}/produtos/000000000000000000000000
 
 ### 404 - id que nem é ObjectId
-GET {{catalogo}}/produtos/id-que-nao-existe
+GET {{baseUrl}}/produtos/id-que-nao-existe
 
 ### Criar produto (201) - SKU com timestamp para poder rodar várias vezes; guarda em "novo"
 # @name novo
-POST {{catalogo}}/produtos
+POST {{baseUrl}}/produtos
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
 Content-Type: application/json
 
 {
@@ -63,8 +94,37 @@ Content-Type: application/json
   "estoque": { "disponivel": 7 }
 }
 
+### 401 - criar produto sem token
+POST {{baseUrl}}/produtos
+Content-Type: application/json
+
+{ "sku": "SEM-TOKEN", "nome": "Sem token", "categoria": "livros", "preco": 10 }
+
+### 401 - criar produto fingindo ser admin pelo cabeçalho (o Kong apaga X-User-* de fora)
+POST {{baseUrl}}/produtos
+X-User-Role: admin
+X-User-Id: 00000000-0000-0000-0000-000000000000
+Content-Type: application/json
+
+{ "sku": "FALSO-ADMIN", "nome": "Falso admin", "categoria": "livros", "preco": 10 }
+
+### 403 - cliente criando produto
+POST {{baseUrl}}/produtos
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "sku": "CLIENTE-001", "nome": "Cliente não pode", "categoria": "livros", "preco": 10 }
+
+### 403 - cliente mexendo no estoque
+PATCH {{baseUrl}}/produtos/{{novo.response.body.$.id}}/estoque
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "ajuste": 100 }
+
 ### 409 - SKU já existe
-POST {{catalogo}}/produtos
+POST {{baseUrl}}/produtos
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
 Content-Type: application/json
 
 {
@@ -76,19 +136,22 @@ Content-Type: application/json
 }
 
 ### 400 - dados inválidos (sem sku, preço negativo)
-POST {{catalogo}}/produtos
+POST {{baseUrl}}/produtos
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
 Content-Type: application/json
 
 { "nome": "Produto ruim", "categoria": "roupas", "preco": -10 }
 
 ### 400 - categoria que não existe
-POST {{catalogo}}/produtos
+POST {{baseUrl}}/produtos
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
 Content-Type: application/json
 
 { "sku": "XYZ-001", "nome": "Sem categoria", "categoria": "brinquedos", "preco": 10 }
 
 ### Substituir produto (200) - PUT manda o produto inteiro; o estoque não muda aqui
-PUT {{catalogo}}/produtos/{{novo.response.body.$.id}}
+PUT {{baseUrl}}/produtos/{{novo.response.body.$.id}}
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
 Content-Type: application/json
 
 {
@@ -101,61 +164,74 @@ Content-Type: application/json
 }
 
 ### 400 - PUT sem preço
-PUT {{catalogo}}/produtos/{{novo.response.body.$.id}}
+PUT {{baseUrl}}/produtos/{{novo.response.body.$.id}}
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
 Content-Type: application/json
 
 { "sku": "{{novo.response.body.$.sku}}", "nome": "Sem preço", "categoria": "livros" }
 
 ### 409 - PUT para um SKU de outro produto
-PUT {{catalogo}}/produtos/{{novo.response.body.$.id}}
+PUT {{baseUrl}}/produtos/{{novo.response.body.$.id}}
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
 Content-Type: application/json
 
 { "sku": "CEL-001", "nome": "Conflito", "categoria": "livros", "preco": 10 }
 
 ### 404 - PUT em produto que não existe
-PUT {{catalogo}}/produtos/000000000000000000000000
+PUT {{baseUrl}}/produtos/000000000000000000000000
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
 Content-Type: application/json
 
 { "sku": "NADA-001", "nome": "Nada", "categoria": "livros", "preco": 10 }
 
 ### Definir estoque (200) - { "disponivel": n } troca o valor
-PATCH {{catalogo}}/produtos/{{novo.response.body.$.id}}/estoque
+PATCH {{baseUrl}}/produtos/{{novo.response.body.$.id}}/estoque
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
 Content-Type: application/json
 
 { "disponivel": 20 }
 
 ### Ajustar estoque (200) - { "ajuste": n } soma ou subtrai
-PATCH {{catalogo}}/produtos/{{novo.response.body.$.id}}/estoque
+PATCH {{baseUrl}}/produtos/{{novo.response.body.$.id}}/estoque
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
 Content-Type: application/json
 
 { "ajuste": -5 }
 
 ### 400 - ajuste que deixaria o estoque negativo
-PATCH {{catalogo}}/produtos/{{novo.response.body.$.id}}/estoque
+PATCH {{baseUrl}}/produtos/{{novo.response.body.$.id}}/estoque
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
 Content-Type: application/json
 
 { "ajuste": -1000 }
 
 ### 400 - estoque negativo direto
-PATCH {{catalogo}}/produtos/{{novo.response.body.$.id}}/estoque
+PATCH {{baseUrl}}/produtos/{{novo.response.body.$.id}}/estoque
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
 Content-Type: application/json
 
 { "disponivel": -1 }
 
 ### 404 - estoque de produto que não existe
-PATCH {{catalogo}}/produtos/000000000000000000000000/estoque
+PATCH {{baseUrl}}/produtos/000000000000000000000000/estoque
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
 Content-Type: application/json
 
 { "ajuste": 1 }
 
 ### Desativar produto (204) - não apaga, só ativo = false
-DELETE {{catalogo}}/produtos/{{novo.response.body.$.id}}
+DELETE {{baseUrl}}/produtos/{{novo.response.body.$.id}}
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
 
 ### O produto ainda existe, com ativo: false (200)
-GET {{catalogo}}/produtos/{{novo.response.body.$.id}}
+GET {{baseUrl}}/produtos/{{novo.response.body.$.id}}
 
 ### 404 - desativar produto que não existe
-DELETE {{catalogo}}/produtos/000000000000000000000000
+DELETE {{baseUrl}}/produtos/000000000000000000000000
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+
+### Produtos por id, ativos ou não (200) - é o que o pedidos usa no checkout
+GET {{baseUrl}}/produtos?ids={{lista.response.body.$[0].id}},{{novo.response.body.$.id}}
 
 ### 404 - rota que não existe
-GET {{catalogo}}/nao-existe
+GET {{baseUrl}}/nao-existe
