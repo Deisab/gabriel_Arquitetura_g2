@@ -1,4 +1,38 @@
 services:
+  # ---------- gateway: Kong sem banco, a única porta da API ----------
+  gateway:
+    image: kong:3.9
+    # Imagem oficial, nenhum código nosso: só o kong.yml montado como volume.
+    # Ao subir, troca __JWT_SECRET__ pelo segredo e entrega o arquivo pronto ao Kong.
+    entrypoint:
+      - sh
+      - -c
+      - sed "s|__JWT_SECRET__|$${JWT_SECRET}|g" /kong/kong.yml > /tmp/kong.yml && exec /docker-entrypoint.sh kong docker-start
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /tmp/kong.yml
+      KONG_PROXY_LISTEN: 0.0.0.0:8000
+      KONG_ADMIN_LISTEN: 0.0.0.0:8001
+      KONG_ADMIN_GUI_LISTEN: 0.0.0.0:8002
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      # libera o require do parser de JWT dentro do post-function (Lua em sandbox)
+      KONG_UNTRUSTED_LUA_SANDBOX_REQUIRES: kong.plugins.jwt.jwt_parser
+      JWT_SECRET: ${JWT_SECRET:-troque-este-segredo-em-producao}
+    ports:
+      - "8080:8000"           # a API da loja
+      - "127.0.0.1:8001:8001" # Admin API (só nesta máquina, para conferir: curl localhost:8001/routes)
+      - "127.0.0.1:8002:8002" # Kong Manager (painel, só nesta máquina)
+    volumes:
+      - ./kong:/kong:ro
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   # ---------- usuarios: Node + Postgres ----------
   usuarios-db:
     image: postgres:16-alpine

@@ -1,0 +1,178 @@
+# Kong sem banco (declarativo): toda a configuração do gateway está aqui, versionada no Git.
+# __JWT_SECRET__ é trocado pela variável JWT_SECRET quando o container sobe (ver docker-compose.yml).
+# Mudou este arquivo? docker compose restart gateway
+#
+# Três níveis de acesso, marcados na tag de cada rota:
+#   publico: nenhum plugin de acesso
+#   logado:  jwt (401 sem token ou token inválido)
+#   admin:   jwt + acl allow [admin] (401 sem token, 403 perfil cliente)
+#
+# "~" no início do caminho = expressão regular. strip_path: false repassa o caminho inteiro.
+
+_format_version: "3.0"
+
+services:
+  # ---------- usuarios ----------
+  - name: usuarios
+    url: http://usuarios:3001
+    routes:
+      - name: login                     # POST /auth/login: público, mas com limite contra força bruta
+        methods: [POST]
+        paths: ["~/auth/login$"]
+        strip_path: false
+        tags: [publico]
+        plugins:
+          - name: rate-limiting
+            config:
+              minute: 10                # a 11ª tentativa no minuto recebe 429
+              limit_by: ip
+              policy: local
+
+      - name: cadastro                  # POST /usuarios
+        methods: [POST]
+        paths: ["~/usuarios$"]
+        strip_path: false
+        tags: [publico]
+
+      - name: listar-usuarios           # GET /usuarios
+        methods: [GET]
+        paths: ["~/usuarios$"]
+        strip_path: false
+        tags: [admin]
+        # &nome / *nome: a receita de admin é escrita uma vez e reaproveitada nas outras rotas.
+        plugins: &so-admin
+          - &jwt
+            name: jwt
+            config:
+              key_claim_name: perfil    # o campo perfil do token aponta o consumer
+              claims_to_verify: [exp]   # sem isso, token vencido passaria
+          - name: acl
+            config:
+              allow: [admin]
+
+      - name: meus-dados                # /usuarios/me e /usuarios/me/enderecos[/:id]
+        paths: ["~/usuarios/me(/.*)?$"]
+        strip_path: false
+        tags: [logado]
+        plugins: &logado [*jwt]
+
+  # ---------- catalogo ----------
+  - name: catalogo
+    url: http://catalogo:3002
+    routes:
+      # Mesmo caminho, métodos diferentes: GET é público, o resto exige admin.
+      - name: vitrine
+        methods: [GET]
+        paths: ["~/(produtos|categorias)(/.*)?$"]
+        strip_path: false
+        tags: [publico]
+
+      - name: gestao-catalogo
+        methods: [POST, PUT, PATCH, DELETE]
+        paths: ["~/(produtos|categorias)(/.*)?$"]
+        strip_path: false
+        tags: [admin]
+        plugins: *so-admin
+
+  # ---------- pedidos ----------
+  - name: pedidos
+    url: http://pedidos:3003
+    routes:
+      - name: carrinho-e-pedidos
+        paths: ["~/(carrinho|pedidos)(/.*)?$"]
+        strip_path: false
+        tags: [logado]
+        plugins: *logado
+
+  # ---------- health de cada serviço: /health/<servico> -> /health ----------
+  # strip_path: true corta /health/<servico> e o Kong encaminha para o caminho do service (/health).
+  - name: usuarios-health
+    url: http://usuarios:3001/health
+    routes:
+      - name: health-usuarios
+        methods: [GET]
+        paths: ["/health/usuarios"]
+        strip_path: true
+        tags: [publico]
+
+  - name: catalogo-health
+    url: http://catalogo:3002/health
+    routes:
+      - name: health-catalogo
+        methods: [GET]
+        paths: ["/health/catalogo"]
+        strip_path: true
+        tags: [publico]
+
+  - name: pedidos-health
+    url: http://pedidos:3003/health
+    routes:
+      - name: health-pedidos
+        methods: [GET]
+        paths: ["/health/pedidos"]
+        strip_path: true
+        tags: [publico]
+
+# Os consumers são perfis, não pessoas: milhares de usuários, dois consumers.
+# key da credencial = valor do campo perfil do token. secret = o mesmo JWT_SECRET de usuarios.
+# Perfil inventado ("superadmin"): não existe consumer com essa key -> 401.
+consumers:
+  - username: cliente
+    jwt_secrets:
+      - { key: cliente, algorithm: HS256, secret: "__JWT_SECRET__" }
+    acls: [{ group: cliente }]
+
+  - username: admin
+    jwt_secrets:
+      - { key: admin, algorithm: HS256, secret: "__JWT_SECRET__" }
+    acls: [{ group: admin }]
+
+# Plugins globais: valem para todas as rotas, inclusive as recusadas.
+plugins:
+  # Um id para cada requisição, repassado aos serviços e devolvido ao cliente.
+  # Se o cliente já mandar um X-Request-Id, o Kong mantém o dele.
+  - name: correlation-id
+    config:
+      header_name: X-Request-Id
+      generator: uuid
+      echo_downstream: true
+
+  # Antes de tudo: ninguém de fora escolhe quem é.
+  - name: pre-function
+    config:
+      access:
+        - |
+          kong.service.request.clear_header("X-User-Id")
+          kong.service.request.clear_header("X-User-Email")
+          kong.service.request.clear_header("X-User-Role")
+
+  # Depois do jwt e do acl: copia id, e-mail e perfil do token para os cabeçalhos que os serviços leem.
+  # A decisão de acesso não está aqui: quem decide é o jwt (401) e o acl (403).
+  # Só roda quando o jwt identificou um consumer (rotas públicas não recebem X-User-*).
+  - name: post-function
+    config:
+      access:
+        - |
+          if not kong.client.get_consumer() then
+            return
+          end
+
+          local token = kong.ctx.shared.authenticated_jwt_token
+          if not token then
+            local authorization = kong.request.get_header("Authorization") or ""
+            token = authorization:match("^[Bb]earer%s+(.+)$")
+          end
+          if not token then
+            return
+          end
+
+          local jwt_parser = require("kong.plugins.jwt.jwt_parser")
+          local jwt = jwt_parser:new(token)
+          if not jwt then
+            return
+          end
+
+          local claims = jwt.claims
+          kong.service.request.set_header("X-User-Id", tostring(claims.sub))
+          kong.service.request.set_header("X-User-Email", tostring(claims.email))
+          kong.service.request.set_header("X-User-Role", tostring(claims.perfil))
