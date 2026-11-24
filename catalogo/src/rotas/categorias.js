@@ -2,14 +2,18 @@ const express = require('express');
 const { categorias } = require('../db');
 const { ErroHttp } = require('../erros');
 const { exigirAdmin } = require('../acesso');
+const { lerOuBuscar, invalidar } = require('../cache');
 const { paraJson } = require('../json');
 const { validarCategoria } = require('../validacao');
 
 const router = express.Router();
 
 router.get('/categorias', async (req, res) => {
-  const lista = await categorias().find().sort({ nome: 1 }).toArray();
-  res.json(lista.map(paraJson));
+  const { valor, cache } = await lerOuBuscar('categorias', async () => {
+    const lista = await categorias().find().sort({ nome: 1 }).toArray();
+    return lista.map(paraJson);
+  });
+  res.set('X-Cache', cache).json(valor);
 });
 
 // slug é opcional: se não vier, é gerado a partir do nome.
@@ -18,6 +22,7 @@ router.post('/categorias', exigirAdmin, async (req, res) => {
 
   try {
     const { insertedId } = await categorias().insertOne(categoria);
+    await invalidar('categoria criada');
     res.status(201).json(paraJson({ _id: insertedId, ...categoria }));
   } catch (err) {
     if (err.code === 11000) throw new ErroHttp(409, 'Já existe uma categoria com este slug.');

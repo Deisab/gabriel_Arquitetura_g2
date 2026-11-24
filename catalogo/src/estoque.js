@@ -1,6 +1,7 @@
 const { ObjectId } = require('mongodb');
 const { produtos, reservas } = require('./db');
 const { publicar } = require('./kafka');
+const { invalidar } = require('./cache');
 
 const OBJECT_ID = /^[0-9a-f]{24}$/i;
 
@@ -62,6 +63,7 @@ async function reservar(evento) {
 
   if (faltou) {
     await devolver(reservados); // faltou um: devolve os que já tirou
+    if (reservados.length > 0) await invalidar('reserva desfeita');
     const motivo = `estoque insuficiente: ${faltou.nome || faltou.produtoId} (pedido ${faltou.quantidade})`;
     await reservas().updateOne({ pedidoId }, { $set: { status: 'insuficiente', motivo } });
     log(evento, `reserva recusada: ${motivo}`);
@@ -75,6 +77,7 @@ async function reservar(evento) {
 
   // 3. Deu tudo certo. O evento repassa o que o pagamento precisa para cobrar sem consultar ninguém.
   await reservas().updateOne({ pedidoId }, { $set: { status: 'reservada', reservadaEm: new Date() } });
+  await invalidar('estoque reservado'); // a vitrine mostra o estoque: o que estava no cache ficou velho
   log(evento, `estoque reservado (${itens.length} itens)`);
   await publicar('estoque', 'estoque.reservado', pedidoId, {
     usuarioId: dados.usuarioId,
@@ -100,6 +103,7 @@ async function mudarReserva(evento, de, para, efeito, descricao) {
   for (const item of reserva.itens) {
     await produtos().updateOne({ _id: new ObjectId(item.produtoId) }, { $inc: efeito(item.quantidade) });
   }
+  await invalidar(`estoque alterado: ${evento.tipo}`);
   log(evento, descricao);
 }
 

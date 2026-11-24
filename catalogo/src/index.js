@@ -2,6 +2,7 @@ const app = require('./app');
 const { conectar, fechar } = require('./db');
 const { seed } = require('../seeds/seed');
 const kafka = require('./kafka');
+const cache = require('./cache');
 const { handlers, TOPICOS_ESCUTADOS } = require('./estoque');
 
 async function iniciar() {
@@ -18,7 +19,7 @@ async function iniciar() {
     process.once(sinal, () => {
       servidor.close();
       kafka.desconectar()
-        .then(() => fechar())
+        .then(() => Promise.allSettled([fechar(), cache.fechar()]))
         .finally(() => process.exit(0));
     });
   }

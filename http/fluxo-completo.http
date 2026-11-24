@@ -1,0 +1,225 @@
+# FLUXO COMPLETO: a saga inteira, do login ao PAGO, e os casos de erro.
+# Rode de cima para baixo, em ordem, sem editar nada (VS Code + REST Client: "Send Request").
+# Nada fixo: o token e os ids vêm das respostas anteriores (# @name). O id de um produto muda a cada subida do zero.
+# Os "Reenvie até mudar" consultam o pedido: o status muda sozinho, por evento (consistência eventual).
+#
+# Painéis: Kafka UI http://localhost:8090 · Mailpit http://localhost:8025
+# Seguir a compra pelos logs: docker compose logs -t --no-log-prefix | grep <X-Request-Id da resposta> | sort
+
+@baseUrl = http://localhost:8080
+@banco = http://localhost:9000
+
+### 0. Saúde do pagamentos pelo gateway (200, status "ok"); os outros: /health/usuarios, /health/catalogo, /health/pedidos
+GET {{baseUrl}}/health/pagamentos
+
+### 0.1 Banco do cartão normal (sem latência e sem falhas), caso alguma demonstração tenha mudado
+POST {{banco}}/config
+Content-Type: application/json
+
+{ "latenciaMs": 0, "falhaPercent": 0 }
+
+### 1. Login do cliente do seed (200) - guarda o token em "login"
+# @name login
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{ "email": "cliente@loja.com", "senha": "cliente123" }
+
+### 1.1 Login do admin do seed (200) - guarda em "loginAdmin"
+# @name loginAdmin
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{ "email": "admin@loja.com", "senha": "admin123" }
+
+### 2. Vitrine (200, público) - guarda em "vitrine"; X-Cache: MISS na primeira vez, HIT depois
+# @name vitrine
+GET {{baseUrl}}/produtos
+
+### 3. Carrinho: o primeiro produto da vitrine (201)
+POST {{baseUrl}}/carrinho/itens
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "produtoId": "{{vitrine.response.body.$[0].id}}", "quantidade": 1 }
+
+### 3.1 Ver o carrinho (200) - { itens, total } com o preço atual do catálogo
+GET {{baseUrl}}/carrinho
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 4. Checkout (202) - nasce em AGUARDANDO_ESTOQUE; publica pedido.criado - guarda em "checkout"
+# @name checkout
+POST {{baseUrl}}/pedidos
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "enderecoEntrega": { "cep": "97010-000", "logradouro": "Rua do Acampamento", "numero": "100", "cidade": "Santa Maria", "uf": "RS" },
+  "formaPagamento": "pix"
+}
+
+### 5. Reenvie até mudar: AGUARDANDO_ESTOQUE -> AGUARDANDO_PAGAMENTO -> PAGO
+GET {{baseUrl}}/pedidos/{{checkout.response.body.$.id}}
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 6. O pagamento (200): APROVADO, com codigo_transacao TX-... e o número de tentativas
+GET {{baseUrl}}/pagamentos/{{checkout.response.body.$.id}}
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 6.1 O produto: disponivel diminuiu e reservado voltou a 0 (vendido). Mailpit: "Recebemos" e "Pagamento aprovado"
+GET {{baseUrl}}/produtos/{{vitrine.response.body.$[0].id}}
+
+### 6.2 409 - cancelar um pedido PAGO não é permitido
+POST {{baseUrl}}/pedidos/{{checkout.response.body.$.id}}/cancelar
+Authorization: Bearer {{login.response.body.$.token}}
+
+# ===================== CASO DE ERRO 1: CARTÃO RECUSADO (final 0002) =====================
+# O banco responde 402. pagamento.recusado: o catálogo DEVOLVE o estoque e o pedido vira CANCELADO.
+
+### 7. Estoque antes do cartão recusado - guarda em "antesRecusa" (compare o disponivel no passo 7.5)
+# @name antesRecusa
+GET {{baseUrl}}/produtos/{{vitrine.response.body.$[1].id}}
+
+### 7.1 Carrinho (201)
+POST {{baseUrl}}/carrinho/itens
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "produtoId": "{{vitrine.response.body.$[1].id}}", "quantidade": 1 }
+
+### 7.2 Checkout com o cartão final 0002 (202) - guarda em "recusado"
+# @name recusado
+POST {{baseUrl}}/pedidos
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "enderecoEntrega": { "cep": "97010-000", "logradouro": "Rua do Acampamento", "numero": "100", "cidade": "Santa Maria", "uf": "RS" },
+  "formaPagamento": "cartao",
+  "cartao": { "numero": "4111 1111 1111 0002" }
+}
+
+### 7.3 Reenvie até mudar: CANCELADO, motivo "saldo insuficiente"
+GET {{baseUrl}}/pedidos/{{recusado.response.body.$.id}}
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 7.4 O pagamento: RECUSADO, motivo "saldo insuficiente"
+GET {{baseUrl}}/pagamentos/{{recusado.response.body.$.id}}
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 7.5 O estoque voltou ao valor do passo 7 (compensação do catálogo)
+GET {{baseUrl}}/produtos/{{vitrine.response.body.$[1].id}}
+
+# ===================== CASO DE ERRO 2: CANCELAMENTO COM ESTORNO =====================
+# O banco demora 1,5 s. O cliente cancela no meio da cobrança: pagamentos cobra, recebe o pedido.cancelado,
+# ESTORNA no banco e publica pagamento.estornado. O pedido continua CANCELADO e o estoque volta.
+
+### 8. Banco lento: 1500 ms (dentro do timeout de 2 s)
+POST {{banco}}/config
+Content-Type: application/json
+
+{ "latenciaMs": 1500, "falhaPercent": 0 }
+
+### 8.1 Carrinho (201)
+POST {{baseUrl}}/carrinho/itens
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "produtoId": "{{vitrine.response.body.$[0].id}}", "quantidade": 1 }
+
+### 8.2 Checkout com cartão (202) - guarda em "cancelado"
+# @name cancelado
+POST {{baseUrl}}/pedidos
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "enderecoEntrega": { "cep": "97010-000", "logradouro": "Rua do Acampamento", "numero": "100", "cidade": "Santa Maria", "uf": "RS" },
+  "formaPagamento": "cartao",
+  "cartao": { "numero": "4111 1111 1111 1111" }
+}
+
+### 8.3 Cancelar logo em seguida (200) - publica pedido.cancelado
+POST {{baseUrl}}/pedidos/{{cancelado.response.body.$.id}}/cancelar
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 8.4 Reenvie até mudar: pagamento ESTORNADO (ou CANCELADO, se o cancelamento chegou antes da cobrança)
+GET {{baseUrl}}/pagamentos/{{cancelado.response.body.$.id}}
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 8.5 O pedido continua CANCELADO ("cancelado pelo cliente"), mesmo com o banco tendo aprovado
+GET {{baseUrl}}/pedidos/{{cancelado.response.body.$.id}}
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 8.6 Banco de volta ao normal
+POST {{banco}}/config
+Content-Type: application/json
+
+{ "latenciaMs": 0, "falhaPercent": 0 }
+
+# ===================== CASO DE ERRO 3: CLIENTE EM ROTA DE ADMIN =====================
+
+### 9. 403 - cliente criando produto (jwt ok, mas o acl só deixa o grupo admin)
+POST {{baseUrl}}/produtos
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "sku": "CLIENTE-001", "nome": "Cliente não pode", "categoria": "livros", "preco": 10 }
+
+### 9.1 403 - cliente listando os usuários
+GET {{baseUrl}}/usuarios
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 9.2 403 - cliente listando todos os pagamentos
+GET {{baseUrl}}/pagamentos
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 9.3 401 - sem token, fingindo ser admin pelo cabeçalho (o Kong apaga os X-User-* de fora)
+GET {{baseUrl}}/usuarios
+X-User-Role: admin
+
+# ===================== CACHE NA VITRINE =====================
+
+### 10. Categorias (X-Cache: MISS ou HIT)
+GET {{baseUrl}}/categorias
+
+### 10.1 De novo: X-Cache: HIT
+GET {{baseUrl}}/categorias
+
+### 10.2 Admin cria um produto (201) - guarda em "novo" (toda escrita invalida o cache)
+# @name novo
+POST {{baseUrl}}/produtos
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "sku": "CACHE-{{$timestamp}}",
+  "nome": "Livro do Cache",
+  "categoria": "livros",
+  "preco": 50,
+  "atributos": { "autor": "Phil Karlton", "paginas": 2 },
+  "estoque": { "disponivel": 5 }
+}
+
+### 10.3 O produto: X-Cache: MISS (foi ao Mongo e guardou no Redis)
+GET {{baseUrl}}/produtos/{{novo.response.body.$.id}}
+
+### 10.4 De novo: X-Cache: HIT, preço 50
+GET {{baseUrl}}/produtos/{{novo.response.body.$.id}}
+
+### 10.5 Admin muda o preço para 45 (200) - INCR catalogo:versao: as chaves antigas param de ser lidas
+PUT {{baseUrl}}/produtos/{{novo.response.body.$.id}}
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "sku": "{{novo.response.body.$.sku}}",
+  "nome": "Livro do Cache",
+  "categoria": "livros",
+  "preco": 45,
+  "ativo": true,
+  "atributos": { "autor": "Phil Karlton", "paginas": 2 }
+}
+
+### 10.6 Logo depois: X-Cache: MISS e o preço novo (45). Ninguém vê o preço velho.
+GET {{baseUrl}}/produtos/{{novo.response.body.$.id}}

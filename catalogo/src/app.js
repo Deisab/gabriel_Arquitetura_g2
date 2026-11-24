@@ -1,6 +1,7 @@
 const express = require('express');
 const { ping } = require('./db');
 const { kafkaOk } = require('./kafka');
+const { redisOk } = require('./cache');
 const { rotaNaoEncontrada, tratarErros } = require('./erros');
 
 const app = express();
@@ -16,14 +17,23 @@ app.use((req, res, next) => {
   next();
 });
 
+const comPrazo = (promessa, ms = 2000) => Promise.race([
+  promessa,
+  new Promise((_, rejeitar) => setTimeout(() => rejeitar(new Error('timeout')), ms)),
+]);
+
 // No gateway: /health/catalogo. Sem Mongo ou sem Kafka: "fora do ar", 503.
+// Redis fora: "degradado", 200. O cache só acelera: nunca tira o serviço do ar.
 app.get('/health', async (req, res) => {
-  const [banco, kafka] = await Promise.all([
-    ping().then(() => 'ok', () => 'fora do ar'),
+  const [banco, kafka, cache] = await Promise.all([
+    comPrazo(ping()).then(() => 'ok', () => 'fora do ar'),
     kafkaOk().then((ok) => (ok ? 'ok' : 'fora do ar')),
+    redisOk().then((ok) => (ok ? 'ok' : 'fora do ar')),
   ]);
-  const status = banco === 'ok' && kafka === 'ok' ? 'ok' : 'fora do ar';
-  res.status(status === 'ok' ? 200 : 503).json({ servico: 'catalogo', status, dependencias: { banco, kafka } });
+  let status = 'ok';
+  if (banco !== 'ok' || kafka !== 'ok') status = 'fora do ar';
+  else if (cache !== 'ok') status = 'degradado';
+  res.status(status === 'fora do ar' ? 503 : 200).json({ servico: 'catalogo', status, dependencias: { banco, kafka, cache } });
 });
 
 app.use(require('./rotas/produtos'));

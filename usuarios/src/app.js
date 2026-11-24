@@ -15,13 +15,11 @@ app.use((req, res, next) => {
   next();
 });
 
+// No gateway: /health/usuarios. Sem o Postgres o serviço não consegue trabalhar: "fora do ar", 503.
 app.get('/health', async (req, res) => {
-  try {
-    await pool.query('SELECT 1');
-    res.json({ status: 'ok', servico: 'usuarios', banco: 'ok' });
-  } catch {
-    res.status(503).json({ status: 'erro', servico: 'usuarios', banco: 'indisponível' });
-  }
+  const banco = await pool.query('SELECT 1').then(() => 'ok', () => 'fora do ar');
+  const status = banco === 'ok' ? 'ok' : 'fora do ar';
+  res.status(status === 'ok' ? 200 : 503).json({ servico: 'usuarios', status, dependencias: { banco } });
 });
 
 app.use(require('./rotas/auth'));

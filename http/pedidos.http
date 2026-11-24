@@ -231,6 +231,6 @@ Authorization: Bearer {{login.response.body.$.token}}
 GET {{baseUrl}}/pedidos
 Authorization: Bearer {{login.response.body.$.token}}
 
-### 404 - rota que não existe (o Kong responde)
-GET {{baseUrl}}/pagamentos
+### 404 - rota que não existe (o Kong responde: nenhuma route casa)
+GET {{baseUrl}}/entregas
 Authorization: Bearer {{login.response.body.$.token}}

@@ -4,6 +4,7 @@ const { produtos, categorias } = require('../db');
 const { ErroHttp } = require('../erros');
 const { paraJson } = require('../json');
 const { exigirAdmin } = require('../acesso');
+const { lerOuBuscar, invalidar } = require('../cache');
 const { idDoProduto, validarProduto } = require('../validacao');
 
 // GET é público; o resto é de admin. O gateway confere o token e o perfil (jwt + acl) antes de chegar aqui.
@@ -24,6 +25,7 @@ function skuDuplicado(err) {
 
 // GET /produtos?categoria=livros&busca=java  -> só produtos ativos
 // GET /produtos?ids=a,b,c                    -> esses produtos, ativos ou não (usado pelo pedidos no checkout)
+// A vitrine passa pelo cache (X-Cache: HIT, MISS ou OFF). O ?ids= do checkout NÃO: o preço precisa ser o de agora.
 router.get('/produtos', async (req, res) => {
   if (typeof req.query.ids === 'string') {
     const ids = [...new Set(req.query.ids.split(',').map((id) => id.trim()).filter(Boolean))];
@@ -41,15 +43,24 @@ router.get('/produtos', async (req, res) => {
   if (categoria) filtro.categoria = categoria;
   if (busca) filtro.nome = { $regex: escaparRegex(busca), $options: 'i' };
 
-  const lista = await produtos().find(filtro).sort({ nome: 1 }).toArray();
-  res.json(lista.map(paraJson));
+  // Cada filtro é uma chave do cache: catalogo:v<versao>:produtos:categoria=livros&busca=java
+  const nome = `produtos:categoria=${categoria}&busca=${busca.toLowerCase()}`;
+  const { valor, cache } = await lerOuBuscar(nome, async () => {
+    const lista = await produtos().find(filtro).sort({ nome: 1 }).toArray();
+    return lista.map(paraJson);
+  });
+  res.set('X-Cache', cache).json(valor);
 });
 
 // Devolve também produtos desativados (com ativo: false): quem consulta decide o que fazer.
 router.get('/produtos/:id', async (req, res) => {
-  const produto = await produtos().findOne({ _id: idDoProduto(req.params.id) });
-  if (!produto) throw new ErroHttp(404, 'Produto não encontrado.');
-  res.json(paraJson(produto));
+  const _id = idDoProduto(req.params.id);
+  const { valor, cache } = await lerOuBuscar(`produto:${_id}`, async () => {
+    const produto = await produtos().findOne({ _id });
+    if (!produto) throw new ErroHttp(404, 'Produto não encontrado.'); // 404 não vai para o cache
+    return paraJson(produto);
+  });
+  res.set('X-Cache', cache).json(valor);
 });
 
 router.post('/produtos', exigirAdmin, async (req, res) => {
@@ -58,6 +69,7 @@ router.post('/produtos', exigirAdmin, async (req, res) => {
 
   try {
     const { insertedId } = await produtos().insertOne(produto);
+    await invalidar('produto criado');
     res.status(201).json(paraJson({ _id: insertedId, ...produto }));
   } catch (err) {
     throw skuDuplicado(err);
@@ -72,6 +84,7 @@ router.put('/produtos/:id', exigirAdmin, async (req, res) => {
   try {
     const produto = await produtos().findOneAndUpdate({ _id }, { $set: dados }, { returnDocument: 'after' });
     if (!produto) throw new ErroHttp(404, 'Produto não encontrado.');
+    await invalidar('produto alterado');
     res.json(paraJson(produto));
   } catch (err) {
     throw skuDuplicado(err);
@@ -111,6 +124,7 @@ router.patch('/produtos/:id/estoque', exigirAdmin, async (req, res) => {
     if (!existe) throw new ErroHttp(404, 'Produto não encontrado.');
     throw new ErroHttp(400, 'Estoque não pode ficar negativo.', [`estoque disponível é menor que ${-corpo.ajuste}`]);
   }
+  await invalidar('estoque alterado');
   res.json(paraJson(produto));
 });
 
@@ -118,6 +132,7 @@ router.patch('/produtos/:id/estoque', exigirAdmin, async (req, res) => {
 router.delete('/produtos/:id', exigirAdmin, async (req, res) => {
   const { matchedCount } = await produtos().updateOne({ _id: idDoProduto(req.params.id) }, { $set: { ativo: false } });
   if (matchedCount === 0) throw new ErroHttp(404, 'Produto não encontrado.');
+  await invalidar('produto desativado');
   res.status(204).end();
 });
 

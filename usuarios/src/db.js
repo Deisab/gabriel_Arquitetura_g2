@@ -2,7 +2,12 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { Pool } = require('pg');
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+// connectionTimeoutMillis: banco fora responde rápido (o /health não fica pendurado).
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, connectionTimeoutMillis: 2000 });
+
+// Banco caiu com uma conexão ociosa no pool: o pg emite 'error'. Sem este handler, o processo morre.
+// Com ele, o serviço continua de pé, o /health responde 503 e as conexões voltam quando o banco voltar.
+pool.on('error', (err) => console.error(`[usuarios] conexão com o Postgres perdida: ${err.message}`));
 
 const esperar = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 

@@ -1,3 +1,7 @@
+# Sobe tudo com um comando: docker compose up -d --build
+# Cada serviço tem healthcheck chamando o próprio /health (wget, de dentro do container): docker compose ps
+# mostra (healthy) ou (unhealthy). Quem depende de banco e Kafka só sobe quando eles estão healthy.
+#
 # Portas publicadas: o gateway (8080, e 8001/8002 do painel só nesta máquina), o Kafka UI (8090),
 # o Mailpit (8025) e o banco-falso (9000, o "banco do cartão", que não é nosso). Serviços, bancos e o Kafka ficam na rede interna do compose.
 services:
@@ -33,9 +37,26 @@ services:
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
     ports:
       - "8090:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
     depends_on:
       kafka:
         condition: service_healthy
+
+  # ---------- redis: cache da vitrine do catálogo ----------
+  # Sem persistência (--save "" e sem AOF): ao reiniciar, volta vazio em vez de voltar com dado velho.
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 
   # Mailpit: servidor de e-mail de mentira. Caixa de entrada em http://localhost:8025
   mailpit:
@@ -66,6 +87,8 @@ services:
       KONG_UNTRUSTED_LUA_SANDBOX_REQUIRES: kong.plugins.jwt.jwt_parser
       # o DNS do Docker responde com TTL longo; um container recriado ganha outro IP e o Kong daria 502
       KONG_DNS_VALID_TTL: 10
+      KONG_DNS_NOT_FOUND_TTL: 1 # nome que ainda não existia (container subindo): perguntar de novo logo
+      KONG_DNS_ERROR_TTL: 1
       JWT_SECRET: ${JWT_SECRET:-troque-este-segredo-em-producao}
     ports:
       - "8080:8000"           # a API da loja
@@ -78,7 +101,16 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-    depends_on: [usuarios, catalogo, pedidos, pagamentos]
+    # Só sobe quando os serviços estão healthy: quando o "docker compose up -d" termina, a loja já vende.
+    depends_on:
+      usuarios:
+        condition: service_healthy
+      catalogo:
+        condition: service_healthy
+      pedidos:
+        condition: service_healthy
+      pagamentos:
+        condition: service_healthy
 
   # ---------- usuarios: Node + Postgres ----------
   usuarios-db:
@@ -97,11 +129,18 @@ services:
 
   usuarios:
     build: ./usuarios
+    restart: unless-stopped
     environment:
       PORT: 3001
       DATABASE_URL: postgres://usuarios:usuarios@usuarios-db:5432/usuarios
       JWT_SECRET: ${JWT_SECRET:-troque-este-segredo-em-producao}
       JWT_EXPIRES_IN: 2h
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
     depends_on:
       usuarios-db:
         condition: service_healthy
@@ -119,17 +158,28 @@ services:
 
   catalogo:
     build: ./catalogo
+    restart: unless-stopped
     environment:
       PORT: 3002
       MONGO_URL: mongodb://catalogo-db:27017
       MONGO_DB: catalogo
       KAFKA_BROKERS: kafka:9092
+      REDIS_URL: redis://redis:6379
+      CACHE_TTL_SEGUNDOS: 60
     stop_grace_period: 10s
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3002/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
     depends_on:
       catalogo-db:
         condition: service_healthy
       kafka:
         condition: service_healthy
+      redis:
+        condition: service_started # o cache só acelera: o catálogo sobe sem ele
 
   # ---------- pedidos: Node + Postgres (o seu próprio banco) ----------
   pedidos-db:
@@ -148,6 +198,7 @@ services:
 
   pedidos:
     build: ./pedidos
+    restart: unless-stopped
     environment:
       PORT: 3003
       DATABASE_URL: postgres://pedidos:pedidos@pedidos-db:5432/pedidos
@@ -156,6 +207,12 @@ services:
       CATALOGO_TIMEOUT_MS: 3000
       KAFKA_BROKERS: kafka:9092
     stop_grace_period: 10s
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3003/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
     depends_on:
       pedidos-db:
         condition: service_healthy
@@ -179,6 +236,7 @@ services:
 
   pagamentos:
     build: ./pagamentos
+    restart: unless-stopped
     environment:
       PORT: 3005
       DATABASE_URL: postgres://pagamentos:pagamentos@pagamentos-db:5432/pagamentos
@@ -186,32 +244,52 @@ services:
       BANCO_URL: http://banco-falso:3000
       BANCO_TIMEOUT_MS: 2000
     stop_grace_period: 10s
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3005/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
     depends_on:
       pagamentos-db:
         condition: service_healthy
       kafka:
         condition: service_healthy
       banco-falso:
-        condition: service_started
+        condition: service_healthy
 
   # ---------- banco-falso: o banco do cartão, um sistema externo de mentira ----------
   # Fora do Kong, com porta própria: representa o banco de outra empresa. POST :9000/config muda latência e falhas.
   banco-falso:
     build: ./banco-falso
+    restart: unless-stopped
     environment:
       PORT: 3000
     ports:
       - "9000:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
 
   # ---------- notificacoes: só escuta eventos e manda e-mail; sem banco, sem rota no Kong ----------
   notificacoes:
     build: ./notificacoes
+    restart: unless-stopped
     environment:
       PORT: 3004
       KAFKA_BROKERS: kafka:9092
       SMTP_HOST: mailpit
       SMTP_PORT: 1025
     stop_grace_period: 10s
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3004/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
     depends_on:
       kafka:
         condition: service_healthy
