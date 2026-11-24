@@ -84,6 +84,18 @@ services:
         tags: [logado]
         plugins: *logado
 
+  # ---------- pagamentos ----------
+  # jwt: qualquer perfil logado. Quem confere o dono do pedido e o admin é o próprio serviço.
+  - name: pagamentos
+    url: http://pagamentos:3005
+    routes:
+      - name: consultar-pagamentos
+        methods: [GET]
+        paths: ["~/pagamentos(/.*)?$"]
+        strip_path: false
+        tags: [logado]
+        plugins: *logado
+
   # ---------- health de cada serviço: /health/<servico> -> /health ----------
   # strip_path: true corta /health/<servico> e o Kong encaminha para o caminho do service (/health).
   - name: usuarios-health
@@ -110,6 +122,15 @@ services:
       - name: health-pedidos
         methods: [GET]
         paths: ["/health/pedidos"]
+        strip_path: true
+        tags: [publico]
+
+  - name: pagamentos-health
+    url: http://pagamentos:3005/health
+    routes:
+      - name: health-pagamentos
+        methods: [GET]
+        paths: ["/health/pagamentos"]
         strip_path: true
         tags: [publico]
 

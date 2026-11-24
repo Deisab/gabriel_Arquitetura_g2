@@ -4,7 +4,8 @@ Projeto da disciplina de Arquitetura de Sistemas. Cada aula acrescenta uma peça
 
 - **parte 1:** usuários e catálogo;
 - **parte 2:** API Gateway (Kong) e pedidos (tag `aula-gateway-pedidos`);
-- **parte 3: Kafka e eventos** (tag `aula-kafka`): o checkout vira evento, o catálogo reserva, as notificações avisam.
+- **parte 3:** Kafka e eventos (tag `aula-kafka`): o checkout vira evento, o catálogo reserva, as notificações avisam;
+- **parte 4: saga e resiliência** (tag `aula-saga`): pagamentos cobra num banco externo instável; cada serviço desfaz a sua parte quando dá errado.
 
 ```
                  :8080 (a única porta da API)
@@ -15,9 +16,11 @@ Cliente ──JWT──> gateway (Kong, sem banco, kong/kong.yml)
                    └──> pedidos  :3003 ── Postgres
                                  └──────> catalogo (direto, rede interna, timeout 3 s)
 
-KAFKA (KRaft, tópicos pedidos · estoque, 3 partições cada)
-  pedidos ──pedido.criado──> catalogo (reserva) ──estoque.reservado / estoque.insuficiente──> pedidos
-                        └──> notificacoes ──> Mailpit (e-mails)  <── estoque.insuficiente
+KAFKA (KRaft, tópicos pedidos · estoque · pagamentos, 3 partições cada)
+  pedidos ──pedido.criado──> catalogo (reserva) ──estoque.reservado──> pagamentos ──HTTP──> banco-falso :9000
+                                                                          │ timeout · retry · circuit breaker
+                    pagamento.aprovado / recusado / estornado <───────────┘
+  notificacoes escuta tudo ──> Mailpit (e-mails)
 ```
 
 | Serviço    | O que faz                                   | Banco    | Porta |
@@ -26,12 +29,14 @@ KAFKA (KRaft, tópicos pedidos · estoque, 3 partições cada)
 | `usuarios` | cadastro, login (emite o JWT) e endereços   | Postgres | 3001, só na rede interna |
 | `catalogo` | produtos, categorias e estoque              | Mongo    | 3002, só na rede interna |
 | `pedidos`  | carrinho e checkout; status por evento      | Postgres | 3003, só na rede interna |
+| `pagamentos` | cobra no banco do cartão; saga         | Postgres | 3005, só na rede interna |
 | `notificacoes` | só escuta eventos e manda e-mail        | (nenhum) | 3004, só o /health, na rede interna |
+| `banco-falso` | o banco do cartão (sistema externo)      | (memória) | **9000 no host**, fora do Kong |
 | `kafka`    | broker de eventos (KRaft, sem ZooKeeper)    | (log)    | 9092, só na rede interna |
 | `kafka-ui` | painel do Kafka: tópicos, mensagens, lag    | --       | **8090 no host** |
 | `mailpit`  | servidor de e-mail de mentira               | --       | **8025 no host** |
 
-Portas no host: só o gateway (8080, e 8001/8002 do painel em `127.0.0.1`), o Kafka UI (8090) e o Mailpit (8025). Serviços, bancos e o Kafka ficam na rede interna do compose.
+Portas no host: só o gateway (8080, e 8001/8002 do painel em `127.0.0.1`), o Kafka UI (8090), o Mailpit (8025) e o banco-falso (9000). Serviços, bancos e o Kafka ficam na rede interna do compose.
 
 ## Como subir
 
@@ -118,23 +123,76 @@ O checkout não espera mais ninguém além do preço: grava o pedido em `AGUARDA
 | `pedido.criado`        | `pedidos` | pedidos   | catalogo, notificacoes   | usuarioId, clienteEmail, itens, valorTotal, formaPagamento, cartaoFinal |
 | `estoque.reservado`    | `estoque` | catalogo  | pedidos                  | usuarioId, clienteEmail, itens, valorTotal, formaPagamento, cartaoFinal |
 | `estoque.insuficiente` | `estoque` | catalogo  | pedidos, notificacoes    | motivo, usuarioId, clienteEmail |
+| `pedido.cancelado`     | `pedidos` | pedidos   | catalogo, pagamentos, notificacoes | usuarioId, clienteEmail, valorTotal, formaPagamento, cartaoFinal, motivo |
+| `pagamento.aprovado`   | `pagamentos` | pagamentos | pedidos, catalogo, notificacoes | usuarioId, clienteEmail, valor, codigoTransacao |
+| `pagamento.recusado`   | `pagamentos` | pagamentos | pedidos, catalogo, notificacoes | usuarioId, clienteEmail, valor, motivo |
+| `pagamento.estornado`  | `pagamentos` | pagamentos | catalogo, notificacoes | usuarioId, clienteEmail, valor, codigoTransacao |
 
 - **Envelope** igual em todos ([`kafka.js`](pedidos/src/kafka.js), copiado em cada serviço): `{ id, tipo, pedidoId, ocorridoEm, correlationId, dados }`.
 - **Chave** de toda mensagem = id do pedido: os eventos de um pedido caem na mesma partição, em ordem.
 - **correlationId** = o `X-Request-Id` do Kong. Segue de evento em evento e aparece em toda linha de log (`req=...`).
 - **Tópicos** `pedidos`, `estoque` e `pagamentos`, com 3 partições, criados por quem sobe primeiro (`listTopics` + `createTopics`).
-- **Consumer groups**: um por serviço (`pedidos`, `catalogo`, `notificacoes`). Réplicas do mesmo serviço dividem as partições.
+- **Consumer groups**: um por serviço (`pedidos`, `catalogo`, `pagamentos`, `notificacoes`). Réplicas do mesmo serviço dividem as partições.
 - **Pelo menos uma vez**: o offset é confirmado depois do handler. Todo handler é idempotente:
   - catálogo: `reservas.pedidoId` é único; o mesmo `pedido.criado` não reserva duas vezes;
   - pedidos: filtro de estado (`estoque.reservado` só muda o pedido se ele ainda está em `AGUARDANDO_ESTOQUE`).
 - **Reserva tudo ou nada**: `updateOne` com `estoque.disponivel: { $gte: quantidade }` (dois pedidos ao mesmo tempo não deixam o estoque negativo). Faltou um item: devolve os que já tirou e publica `estoque.insuficiente`. Reservado não é vendido: `disponivel` diminui e `reservado` aumenta.
-- **E-mails** (Mailpit, http://localhost:8025): "Recebemos o seu pedido" (`pedido.criado`) e "cancelado: sem estoque" (`estoque.insuficiente`).
+- **E-mails** (Mailpit, http://localhost:8025): pedido recebido, sem estoque, pagamento aprovado, recusado (com o motivo), estornado e pedido cancelado.
 
-O status do pedido:
+O status do pedido, do começo ao fim:
 
 ```
-AGUARDANDO_ESTOQUE ──estoque.reservado──> AGUARDANDO_PAGAMENTO ──(pagamento: próxima aula)──> PAGO
-        └──────────estoque.insuficiente──> CANCELADO (com o motivo)
+AGUARDANDO_ESTOQUE ──estoque.reservado──> AGUARDANDO_PAGAMENTO ──pagamento.aprovado──> PAGO
+   │  └──estoque.insuficiente──┐               │
+   │                           ▼               │
+   └──pagamento.recusado──> CANCELADO <────────┴── pagamento.recusado · cancelado pelo cliente
+```
+
+Cada seta só vale a partir do estado de origem: um evento repetido ou atrasado não leva o pedido para trás (um `CANCELADO` não volta a `PAGO` porque o banco aprovou atrasado).
+
+## Saga e resiliência
+
+Uma compra grava em três bancos (Postgres de pedidos, Mongo do catálogo, Postgres de pagamentos): não existe um ROLLBACK que desfaça os três. Cada passo é uma transação local com uma **compensação**, disparada por evento (coreografia):
+
+| Passo                | Serviço      | Compensação                     | Disparada por |
+|----------------------|--------------|---------------------------------|---------------|
+| criar o pedido       | pedidos      | marcar `CANCELADO` com o motivo | `estoque.insuficiente`, `pagamento.recusado` |
+| reservar o estoque   | catalogo     | devolver ao disponível          | `pagamento.recusado`, `pedido.cancelado`, `pagamento.estornado` |
+| cobrar               | pagamentos   | estornar no banco (ou bloquear a cobrança futura) | `pedido.cancelado` |
+| avisar o cliente     | notificacoes | mandar outro e-mail             | qualquer cancelamento |
+
+- **A ordem importa:** reservar (barato de desfazer) vem antes de cobrar (estorno custa taxa e aparece no extrato). Sem estoque, o banco nem é chamado.
+- **Compensações idempotentes:** o catálogo só devolve se a reserva ainda está `reservada` (ou `confirmada`, no estorno); liberar duas vezes não devolve duas vezes.
+- **Cancelar no meio da cobrança:** pagamentos grava `CANCELADO` (`ON CONFLICT DO NOTHING`). Se gravou, não tinha cobrado e a cobrança futura é ignorada. Se já existia `APROVADO`, estorna e publica `pagamento.estornado`. Se a cobrança estava em andamento (`PENDENTE`), marca `CANCELADO` e quem está cobrando estorna quando o banco responder.
+- **Estorno que falha:** fica gravado como `ESTORNO_PENDENTE` e uma rotina tenta de novo a cada 30 s.
+
+O pagamentos chama o banco-falso (HTTP) com três padrões, um em volta do outro ([`pagamentos/src/banco.js`](pagamentos/src/banco.js)):
+
+| Padrão | Configuração | Comportamento |
+|--------|--------------|---------------|
+| **Timeout** | 2 s por chamada (`AbortSignal.timeout`) | não espera para sempre; timeout quer dizer "não sei se cobrou" |
+| **Retry** | até 3 tentativas, esperando 500 ms e 1 s (+ jitter) | só para timeout, erro de rede e 5xx. 402 é resposta: não repete |
+| **Circuit breaker** | opossum: abre com 50% de falha em ≥ 5 chamadas (janela de 10 s), 15 s até o meio-aberto | com o circuito aberto, falha na hora sem chamar o banco |
+| **Idempotência** | `referencia` = id do pedido | o banco não cobra duas vezes a mesma referência; o retry é seguro |
+
+Esgotou as tentativas ou o circuito está aberto: pagamento `ERRO` e `pagamento.recusado` com o motivo "banco indisponível (...)". O pedido é cancelado e o estoque devolvido (fallback: falhar rápido). Se desistiu por timeout, pede o estorno da referência por segurança. O estado do circuito aparece em `GET /health/pagamentos` (`circuitoBancoExterno: fechado | aberto | meio-aberto`). O estorno não passa pelo circuit breaker: devolver dinheiro é importante demais para ser barrado.
+
+### Como demonstrar
+
+Os arquivos [`http/fluxo-compra.http`](http/fluxo-compra.http) e [`http/demos.http`](http/demos.http) fazem tudo isto; o banco-falso é configurado direto em `http://localhost:9000/config`.
+
+| Cenário | Como provocar | Esperado |
+|---------|---------------|----------|
+| Caminho feliz | pix ou cartão 4111... | `PAGO`; o estoque sai do reservado (vendido) |
+| Cartão recusado | cartão com final `0002` | `CANCELADO` (saldo insuficiente); o estoque volta |
+| Cancelar na cobrança | `{ "latenciaMs": 1500 }`, checkout e cancelar em seguida | pagamento `ESTORNADO` (ou `CANCELADO`); o estoque volta |
+| Banco instável | `{ "falhaPercent": 30 }` | `PAGO`, alguns com 2 ou 3 tentativas |
+| Banco fora | `{ "falhaPercent": 100 }`, várias compras | logs `CIRCUITO ABERTO`; `/health/pagamentos` "aberto" e "degradado"; pedidos `CANCELADO` |
+| Banco lento | `{ "latenciaMs": 3000 }` | `ERRO` por timeout, estorno de segurança, pedido `CANCELADO` |
+| Volta ao normal | `{ "latenciaMs": 0, "falhaPercent": 0 }` | em 15 s o circuito vai a "meio-aberto"; na próxima compra, "fechado" |
+
+```bash
+docker compose logs -f pagamentos banco-falso
 ```
 
 Para seguir uma compra pelos logs:
@@ -245,6 +303,24 @@ Corpo do checkout (`POST /pedidos`):
 
 O pedido nasce em `AGUARDANDO_ESTOQUE` (202 e não 201: foi aceito, mas ainda não terminou) e anda sozinho pelos eventos (seção **Eventos**). O estoque não é decidido no checkout: quem decide é a reserva no catálogo. Sem estoque, o checkout ainda responde 202 e o pedido vira `CANCELADO` com o `motivo`. Cancelar só é possível em `AGUARDANDO_ESTOQUE` ou `AGUARDANDO_PAGAMENTO`.
 
+### pagamentos
+
+| Método | Rota                       | Acesso  | No Kong | Retornos |
+|--------|----------------------------|---------|---------|----------|
+| GET    | `/pagamentos/:pedidoId`    | logado  | jwt     | 200 · 401 · 404 (não existe ou o pedido não é seu; admin vê todos) |
+| GET    | `/pagamentos`              | admin   | jwt     | 200 · 401 · 403 (o serviço confere o perfil) |
+| GET    | `/health/pagamentos`       | público | --      | 200 ok/degradado · 503 |
+
+Status do pagamento: `PENDENTE` (gravado antes de chamar o banco), `APROVADO`, `RECUSADO` (402), `ERRO` (banco não respondeu), `CANCELADO` (pedido cancelado antes da cobrança), `ESTORNADO`, `ESTORNO_PENDENTE`. Com `tentativas`, `codigo_transacao` e `motivo`.
+
+### banco-falso (`http://localhost:9000`, fora do Kong)
+
+| Método | Rota          | O que faz |
+|--------|---------------|-----------|
+| POST   | `/cobrancas`  | `{ valor, cartaoFinal, referencia }` → 201 `{ aprovado, codigo: "TX-..." }` · 402 `{ motivo: "saldo insuficiente" }` (final 0002) · 503 (falhaPercent) |
+| POST   | `/estornos`   | `{ codigo, referencia }` → 201 · 404 (nada cobrado) |
+| GET/POST | `/config`   | `{ latenciaMs, falhaPercent }`: ver e mudar ao vivo |
+
 ### Formato de erro (todos os serviços)
 
 ```json
@@ -276,8 +352,13 @@ O pedido nasce em `AGUARDANDO_ESTOQUE` (202 e não 201: foi aceito, mas ainda n�
 │       ├── eventos.js      # reações a estoque.* (filtro de estado)
 │       ├── identidade.js   # lê X-User-* do gateway
 │       └── kafka.js        # envelope, publicar, consumir (igual em todos os serviços)
-└── notificacoes/           # sem banco, sem rota no Kong: escuta e manda e-mail
-    └── src/
+├── notificacoes/           # sem banco, sem rota no Kong: escuta e manda e-mail
+├── pagamentos/
+│   ├── migrations/         # pagamentos (pedido_id UNIQUE)
+│   └── src/
+│       ├── banco.js        # timeout, retry, circuit breaker (opossum), estorno
+│       └── saga.js         # estoque.reservado -> cobra; pedido.cancelado -> estorna/bloqueia
+└── banco-falso/            # o banco do cartão de mentira (porta 9000)
 ```
 
 O catálogo ganhou `src/estoque.js` (reserva) e a coleção `reservas`.
@@ -350,6 +431,20 @@ Cada serviço é independente: tem o próprio `package.json`, `Dockerfile` e ban
 ## Limitações conhecidas
 
 - **Escrita dupla:** o pedido é gravado e o evento publicado depois do COMMIT. Se o Kafka cair entre os dois, o pedido fica parado em `AGUARDANDO_ESTOQUE`. A solução é o padrão Outbox (gravar o evento numa tabela na mesma transação e publicar depois), que não foi feito.
+- **Esperar o banco voltar:** com o banco fora, o pedido é cancelado (fallback simples). A alternativa (deixar o pagamento `PENDENTE` e pausar o consumo com o circuito aberto) não perde a venda, mas prende o estoque e deixa o cliente sem resposta.
+- **Reservas sem validade:** o estoque fica reservado enquanto o pagamento não termina; em produção a reserva expiraria.
+- **Um circuito por réplica:** com várias réplicas de pagamentos, cada uma tem o seu circuit breaker em memória.
 - **Sem DLQ:** um handler que falha é tentado 5 vezes com espera crescente; depois disso o erro é logado e o offset avança. Um tópico de erros (DLQ) para reprocessar fica para depois.
 - **Um broker só, fator 1:** ótimo para aprender, inaceitável em produção.
 - **E-mail repetido:** como a entrega é pelo menos uma vez, um evento reprocessado pode mandar o mesmo e-mail duas vezes.
+
+### ADR-012: saga por coreografia, cancelar quando o banco cai
+
+**Contexto.** Uma compra grava em três bancos; não há transação que cubra Postgres, Mongo, Kafka e um banco de cartão externo (2PC não é opção).
+**Decisão.** Saga por coreografia: cada serviço faz a sua transação local e conhece só a própria compensação (o catálogo devolve o estoque ao ouvir `pagamento.recusado` ou `pedido.cancelado`; o pagamentos estorna ao ouvir `pedido.cancelado`). Com o banco do cartão fora (timeout, 503, circuito aberto), o pagamento vira `ERRO` e publica `pagamento.recusado`: o pedido é cancelado.
+**Consequência.** Nenhum orquestrador para manter, e um serviço novo só começa a escutar. Em troca, não há isolamento (outros veem estados intermediários, como o estoque reservado de um pedido que vai ser recusado), o fluxo inteiro só aparece somando os serviços, e cancelar quando o banco cai perde vendas que dariam certo minutos depois.
+
+### ADR-013: timeout, retry e circuit breaker só no pagamentos → banco
+
+**Decisão.** Timeout de 2 s, até 3 tentativas com espera crescente e circuit breaker (opossum) na chamada ao banco do cartão; nenhuma retentativa no pedidos → catálogo (o cliente está esperando o checkout: melhor um 503 rápido).
+**Consequência.** O retry fica numa camada só, perto de quem falha, e não multiplica as chamadas (3 × 3 × 3). É seguro porque a cobrança tem chave de idempotência (a referência). O estorno não passa pelo circuito.

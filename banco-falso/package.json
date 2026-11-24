@@ -1,0 +1,16 @@
+{
+  "name": "banco-falso",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Banco do cartão de mentira: o sistema externo que demora, falha e recusa quando a gente manda",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}

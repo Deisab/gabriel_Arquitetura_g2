@@ -1,0 +1,191 @@
+# A saga do e-commerce pelo gateway: compra aprovada, cartão recusado e compra cancelada com estorno.
+# Rode na ordem. Os "Reenvie até mudar" consultam o pedido: o status muda sozinho, por evento.
+# Kafka UI: http://localhost:8090 · Mailpit: http://localhost:8025 · banco-falso: http://localhost:9000/config
+
+@baseUrl = http://localhost:8080
+@banco = http://localhost:9000
+
+### Login do cliente (200)
+# @name login
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{ "email": "cliente@loja.com", "senha": "cliente123" }
+
+### Login do admin (200)
+# @name loginAdmin
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{ "email": "admin@loja.com", "senha": "admin123" }
+
+### Banco do cartão normal: sem latência e sem falhas
+POST {{banco}}/config
+Content-Type: application/json
+
+{ "latenciaMs": 0, "falhaPercent": 0 }
+
+### Vitrine de livros - guarda em "livros"
+# @name livros
+GET {{baseUrl}}/produtos?categoria=livros
+
+# ============ 1. COMPRA APROVADA (pix) ============
+# pedido.criado -> catálogo reserva -> estoque.reservado -> pagamentos cobra -> pagamento.aprovado -> PAGO
+
+### 1.1 Carrinho (201)
+POST {{baseUrl}}/carrinho/itens
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "produtoId": "{{livros.response.body.$[0].id}}", "quantidade": 1 }
+
+### 1.2 Checkout (202, AGUARDANDO_ESTOQUE)
+# @name aprovada
+POST {{baseUrl}}/pedidos
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "enderecoEntrega": { "cep": "97010-000", "logradouro": "Rua do Acampamento", "numero": "100", "cidade": "Santa Maria", "uf": "RS" },
+  "formaPagamento": "pix"
+}
+
+### 1.3 Reenvie até mudar: PAGO
+GET {{baseUrl}}/pedidos/{{aprovada.response.body.$.id}}
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 1.4 O pagamento: APROVADO, com codigo_transacao TX-...
+GET {{baseUrl}}/pagamentos/{{aprovada.response.body.$.id}}
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 1.5 O estoque: disponivel diminuiu 1 e reservado voltou a 0 (vendido)
+GET {{baseUrl}}/produtos/{{livros.response.body.$[0].id}}
+
+### 1.6 409 - cancelar um pedido PAGO não é permitido
+POST {{baseUrl}}/pedidos/{{aprovada.response.body.$.id}}/cancelar
+Authorization: Bearer {{login.response.body.$.token}}
+
+# ============ 2. CARTÃO RECUSADO (final 0002) ============
+# O banco responde 402: pagamento.recusado -> catálogo DEVOLVE o estoque; pedido CANCELADO com o motivo.
+
+### 2.1 Estoque antes (anote disponivel)
+GET {{baseUrl}}/produtos/{{livros.response.body.$[1].id}}
+
+### 2.2 Carrinho (201)
+POST {{baseUrl}}/carrinho/itens
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "produtoId": "{{livros.response.body.$[1].id}}", "quantidade": 2 }
+
+### 2.3 Checkout com cartão final 0002 (202)
+# @name recusada
+POST {{baseUrl}}/pedidos
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "enderecoEntrega": { "cep": "97010-000", "logradouro": "Rua do Acampamento", "numero": "100", "cidade": "Santa Maria", "uf": "RS" },
+  "formaPagamento": "cartao",
+  "cartao": { "numero": "4111 1111 1111 0002" }
+}
+
+### 2.4 Reenvie até mudar: CANCELADO, motivo "saldo insuficiente"
+GET {{baseUrl}}/pedidos/{{recusada.response.body.$.id}}
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 2.5 O pagamento: RECUSADO, motivo "saldo insuficiente"
+GET {{baseUrl}}/pagamentos/{{recusada.response.body.$.id}}
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 2.6 O estoque voltou ao valor de antes (compensação)
+GET {{baseUrl}}/produtos/{{livros.response.body.$[1].id}}
+
+# ============ 3. COMPRA CANCELADA COM ESTORNO ============
+# O banco demora 1,5 s. O cliente cancela enquanto a cobrança acontece:
+# pagamentos cobra, recebe o pedido.cancelado, ESTORNA no banco e publica pagamento.estornado; o estoque volta.
+# (Se o cancelamento chegar antes da cobrança, o pagamento fica CANCELADO e o banco nem é chamado: também certo.)
+
+### 3.1 Banco lento: 1500 ms (dentro do timeout de 2 s)
+POST {{banco}}/config
+Content-Type: application/json
+
+{ "latenciaMs": 1500 }
+
+### 3.2 Carrinho (201)
+POST {{baseUrl}}/carrinho/itens
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "produtoId": "{{livros.response.body.$[0].id}}", "quantidade": 1 }
+
+### 3.3 Checkout (202)
+# @name cancelada
+POST {{baseUrl}}/pedidos
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "enderecoEntrega": { "cep": "97010-000", "logradouro": "Rua do Acampamento", "numero": "100", "cidade": "Santa Maria", "uf": "RS" },
+  "formaPagamento": "cartao",
+  "cartao": { "numero": "4111 1111 1111 1111" }
+}
+
+### 3.4 Cancelar logo em seguida (200) - publica pedido.cancelado
+POST {{baseUrl}}/pedidos/{{cancelada.response.body.$.id}}/cancelar
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 3.5 O pedido: CANCELADO, motivo "cancelado pelo cliente" (não volta a PAGO, mesmo que o banco aprove depois)
+GET {{baseUrl}}/pedidos/{{cancelada.response.body.$.id}}
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 3.6 Reenvie até mudar: o pagamento ESTORNADO (ou CANCELADO, se o cancelamento chegou antes da cobrança)
+GET {{baseUrl}}/pagamentos/{{cancelada.response.body.$.id}}
+Authorization: Bearer {{login.response.body.$.token}}
+
+### 3.7 O estoque voltou
+GET {{baseUrl}}/produtos/{{livros.response.body.$[0].id}}
+
+### 3.8 Banco de volta ao normal
+POST {{banco}}/config
+Content-Type: application/json
+
+{ "latenciaMs": 0, "falhaPercent": 0 }
+
+# ============ ACESSO ÀS ROTAS DE PAGAMENTOS ============
+
+### 401 - pagamento sem token
+GET {{baseUrl}}/pagamentos/{{aprovada.response.body.$.id}}
+
+### Admin vê o pagamento de qualquer pedido (200)
+GET {{baseUrl}}/pagamentos/{{aprovada.response.body.$.id}}
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+
+### Cadastro de outra cliente (201) - para o caso "pagamento de outra pessoa"
+# @name cadastroBia
+POST {{baseUrl}}/usuarios
+Content-Type: application/json
+
+{ "nome": "Bia", "email": "bia{{$timestamp}}@loja.com", "senha": "segredo123" }
+
+### Login da Bia (200) - guarda em "loginBia"
+# @name loginBia
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{ "email": "{{cadastroBia.response.body.$.email}}", "senha": "segredo123" }
+
+### 404 - a Bia tentando ver o pagamento do pedido do cliente (não confirma que existe)
+GET {{baseUrl}}/pagamentos/{{aprovada.response.body.$.id}}
+Authorization: Bearer {{loginBia.response.body.$.token}}
+
+### 403 - cliente listando todos os pagamentos (só admin)
+GET {{baseUrl}}/pagamentos
+Authorization: Bearer {{login.response.body.$.token}}
+
+### Todos os pagamentos (200, admin)
+GET {{baseUrl}}/pagamentos
+Authorization: Bearer {{loginAdmin.response.body.$.token}}
+
+### Health do pagamentos (público): { banco, kafka, circuitoBancoExterno }
+GET {{baseUrl}}/health/pagamentos

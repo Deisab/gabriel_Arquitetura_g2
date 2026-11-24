@@ -1,5 +1,5 @@
-# Portas publicadas: o gateway (8080, e 8001/8002 do painel só nesta máquina), o Kafka UI (8090)
-# e o Mailpit (8025). Serviços, bancos e o Kafka ficam na rede interna do compose.
+# Portas publicadas: o gateway (8080, e 8001/8002 do painel só nesta máquina), o Kafka UI (8090),
+# o Mailpit (8025) e o banco-falso (9000, o "banco do cartão", que não é nosso). Serviços, bancos e o Kafka ficam na rede interna do compose.
 services:
   # ---------- kafka: um broker só, modo KRaft (sem ZooKeeper), fator de replicação 1 ----------
   kafka:
@@ -78,7 +78,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-    depends_on: [usuarios, catalogo, pedidos]
+    depends_on: [usuarios, catalogo, pedidos, pagamentos]
 
   # ---------- usuarios: Node + Postgres ----------
   usuarios-db:
@@ -162,6 +162,47 @@ services:
       kafka:
         condition: service_healthy
 
+  # ---------- pagamentos: Node + Postgres; cobra no banco-falso e participa da saga ----------
+  pagamentos-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pagamentos
+      POSTGRES_PASSWORD: pagamentos
+      POSTGRES_DB: pagamentos
+    volumes:
+      - pagamentos-dados:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pagamentos -d pagamentos"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  pagamentos:
+    build: ./pagamentos
+    environment:
+      PORT: 3005
+      DATABASE_URL: postgres://pagamentos:pagamentos@pagamentos-db:5432/pagamentos
+      KAFKA_BROKERS: kafka:9092
+      BANCO_URL: http://banco-falso:3000
+      BANCO_TIMEOUT_MS: 2000
+    stop_grace_period: 10s
+    depends_on:
+      pagamentos-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      banco-falso:
+        condition: service_started
+
+  # ---------- banco-falso: o banco do cartão, um sistema externo de mentira ----------
+  # Fora do Kong, com porta própria: representa o banco de outra empresa. POST :9000/config muda latência e falhas.
+  banco-falso:
+    build: ./banco-falso
+    environment:
+      PORT: 3000
+    ports:
+      - "9000:3000"
+
   # ---------- notificacoes: só escuta eventos e manda e-mail; sem banco, sem rota no Kong ----------
   notificacoes:
     build: ./notificacoes
@@ -181,3 +222,4 @@ volumes:
   usuarios-dados:
   catalogo-dados:
   pedidos-dados:
+  pagamentos-dados:

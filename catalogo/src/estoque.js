@@ -86,8 +86,44 @@ async function reservar(evento) {
   }, correlationId);
 }
 
+// Muda a reserva de um status para outro (filtro de estado) e, se mudou, aplica o efeito no estoque.
+// É a idempotência das compensações: liberar duas vezes não devolve duas vezes.
+async function mudarReserva(evento, de, para, efeito, descricao) {
+  const reserva = await reservas().findOneAndUpdate(
+    { pedidoId: evento.pedidoId, status: de },
+    { $set: { status: para, [`${para}Em`]: new Date() } },
+  );
+  if (!reserva) {
+    log(evento, `${evento.tipo}: nenhuma reserva ${de}, nada a fazer`);
+    return;
+  }
+  for (const item of reserva.itens) {
+    await produtos().updateOne({ _id: new ObjectId(item.produtoId) }, { $inc: efeito(item.quantidade) });
+  }
+  log(evento, descricao);
+}
+
+// pagamento.aprovado: reservado -> vendido. O disponivel já tinha diminuído na reserva; agora sai do reservado.
+const confirmar = (e) => mudarReserva(e, 'reservada', 'confirmada',
+  (q) => ({ 'estoque.reservado': -q }), 'reserva confirmada: produto vendido (saiu do reservado)');
+
+// COMPENSAÇÃO (pagamento.recusado e pedido.cancelado): devolve ao disponível. A mesma função para os dois.
+const liberar = (e) => mudarReserva(e, 'reservada', 'liberada',
+  (q) => ({ 'estoque.disponivel': q, 'estoque.reservado': -q }), `COMPENSAÇÃO (${e.tipo}): estoque devolvido ao disponível`);
+
+// COMPENSAÇÃO (pagamento.estornado): o pedido chegou a ser confirmado (pago) e depois foi estornado,
+// porque o cancelamento cruzou com a aprovação. Devolve o que já tinha saído como vendido.
+const devolverVendido = (e) => mudarReserva(e, 'confirmada', 'devolvida',
+  (q) => ({ 'estoque.disponivel': q }), 'COMPENSAÇÃO (pagamento.estornado): estoque vendido devolvido ao disponível');
+
+// Cada serviço conhece só a própria compensação: o catálogo não sabe por que o pedido falhou,
+// ele escuta e devolve o estoque.
 const handlers = {
   'pedido.criado': reservar,
+  'pagamento.aprovado': confirmar,
+  'pagamento.recusado': liberar,
+  'pedido.cancelado': liberar,
+  'pagamento.estornado': devolverVendido,
 };
 
-module.exports = { handlers, TOPICOS_ESCUTADOS: ['pedidos'] };
+module.exports = { handlers, TOPICOS_ESCUTADOS: ['pedidos', 'pagamentos'] };

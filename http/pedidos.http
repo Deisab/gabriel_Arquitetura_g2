@@ -156,11 +156,12 @@ Content-Type: application/json
   "cartao": { "numero": "4111 1111 1111 1111" }
 }
 
-### Reenvie até mudar: AGUARDANDO_PAGAMENTO (o catálogo reservou o estoque e publicou estoque.reservado)
+### Reenvie até mudar: AGUARDANDO_PAGAMENTO (estoque reservado) e depois PAGO (pagamento aprovado)
+# A saga completa, com recusa e estorno, está em fluxo-compra.http.
 GET {{baseUrl}}/pedidos/{{pedido.response.body.$.id}}
 Authorization: Bearer {{login.response.body.$.token}}
 
-### O estoque do livro: disponivel diminuiu e reservado aumentou
+### O estoque do livro: disponivel diminuiu (e reservado volta a 0 quando o pagamento confirma a venda)
 GET {{baseUrl}}/produtos/{{livros.response.body.$[0].id}}
 
 ### Carrinho depois do checkout (200, vazio)
@@ -184,17 +185,18 @@ GET {{baseUrl}}/pedidos/00000000-0000-0000-0000-000000000000
 Authorization: Bearer {{login.response.body.$.token}}
 
 # ---------- cancelar ----------
+# Só em AGUARDANDO_ESTOQUE ou AGUARDANDO_PAGAMENTO. O cancelamento com estorno está em fluxo-compra.http.
 
 ### 404 - cancelar o pedido de outro usuário
 POST {{baseUrl}}/pedidos/{{pedido.response.body.$.id}}/cancelar
 Authorization: Bearer {{loginAdmin.response.body.$.token}}
 
-### Cancelar o pedido (200)
+### 409 - cancelar o pedido PAGO (não é permitido)
 POST {{baseUrl}}/pedidos/{{pedido.response.body.$.id}}/cancelar
 Authorization: Bearer {{login.response.body.$.token}}
 
-### 409 - cancelar de novo (status CANCELADO não permite)
-POST {{baseUrl}}/pedidos/{{pedido.response.body.$.id}}/cancelar
+### 409 - cancelar o pedido sem estoque (já está CANCELADO)
+POST {{baseUrl}}/pedidos/{{semEstoque.response.body.$.id}}/cancelar
 Authorization: Bearer {{login.response.body.$.token}}
 
 # ---------- catálogo fora do ar (503) ----------

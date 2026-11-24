@@ -1,0 +1,99 @@
+# Demonstrações de resiliência: o banco do cartão (banco-falso) instável, fora do ar e lento.
+# O banco-falso fica FORA do Kong (porta 9000): representa o banco de outra empresa, que não é nosso.
+# Em cada cenário: mude o /config aqui, faça uma ou mais compras (fluxo-compra.http, parte 1) e olhe
+#   - o pedido e o pagamento (status, tentativas, motivo);
+#   - o /health/pagamentos (circuitoBancoExterno);
+#   - os logs: docker compose logs -f pagamentos banco-falso
+
+@baseUrl = http://localhost:8080
+@banco = http://localhost:9000
+
+### Configuração atual do banco
+GET {{banco}}/config
+
+### Health do pagamentos: circuitoBancoExterno fechado | aberto | meio-aberto
+GET {{baseUrl}}/health/pagamentos
+
+# ---------- 1. Banco instável: 30% das cobranças dão 503 ----------
+# Esperado: os pedidos saem PAGO, alguns com 2 ou 3 tentativas (o retry resolve).
+# Logs: "tentativa 1/3 falhou: banco respondeu 503".
+
+### 30% de falha
+POST {{banco}}/config
+Content-Type: application/json
+
+{ "latenciaMs": 0, "falhaPercent": 30 }
+
+# ---------- 2. Banco fora do ar: toda cobrança dá 503 ----------
+# Esperado: pagamento ERRO, pedido CANCELADO com motivo "banco indisponível (...)" e o estoque devolvido.
+# Depois de algumas falhas: log "CIRCUITO ABERTO" e /health/pagamentos com circuitoBancoExterno "aberto"
+# e status "degradado" (200). As compras seguintes falham na hora, sem chamar o banco.
+# Volte ao normal (cenário 4): em 15 s o circuito passa a "meio-aberto" e, na próxima compra, "fechado".
+
+### 100% de falha (circuito abre)
+POST {{banco}}/config
+Content-Type: application/json
+
+{ "falhaPercent": 100 }
+
+### Veja o circuito abrindo (depois de 2 ou 3 compras)
+GET {{baseUrl}}/health/pagamentos
+
+# ---------- 3. Banco lento: 3 s, acima do timeout de 2 s ----------
+# Esperado: "tentativa 1/3 falhou: sem resposta em 2000 ms (timeout)". O banco COBROU, só não respondeu a tempo:
+# timeout não quer dizer "não aconteceu". Esgotadas as tentativas, pagamentos pede o estorno da referência
+# por segurança (log do banco-falso: "ESTORNO da cobrança"), grava ERRO e o pedido vira CANCELADO.
+# A referência (id do pedido) evita a cobrança dupla: "cobrança ... REPETIDA: devolvendo a mesma".
+
+### 3000 ms de latência (timeout)
+POST {{banco}}/config
+Content-Type: application/json
+
+{ "latenciaMs": 3000, "falhaPercent": 0 }
+
+# ---------- 4. De volta ao normal ----------
+
+### Sem latência e sem falhas
+POST {{banco}}/config
+Content-Type: application/json
+
+{ "latenciaMs": 0, "falhaPercent": 0 }
+
+# ---------- O banco-falso direto (sem a loja) ----------
+
+### Cobrança aprovada (201, codigo TX-...)
+POST {{banco}}/cobrancas
+Content-Type: application/json
+
+{ "valor": 60, "cartaoFinal": "1111", "referencia": "demo-{{$timestamp}}" }
+
+### Cartão final 0002: 402 saldo insuficiente
+POST {{banco}}/cobrancas
+Content-Type: application/json
+
+{ "valor": 60, "cartaoFinal": "0002", "referencia": "demo-recusa-{{$timestamp}}" }
+
+### Mesma referência duas vezes: a segunda devolve a mesma cobrança, sem cobrar de novo
+# @name repetida
+POST {{banco}}/cobrancas
+Content-Type: application/json
+
+{ "valor": 60, "referencia": "demo-repetida" }
+
+### Repetida (mesmo codigo)
+POST {{banco}}/cobrancas
+Content-Type: application/json
+
+{ "valor": 60, "referencia": "demo-repetida" }
+
+### Estorno da cobrança repetida (201)
+POST {{banco}}/estornos
+Content-Type: application/json
+
+{ "codigo": "{{repetida.response.body.$.codigo}}", "referencia": "demo-repetida" }
+
+### Estorno de algo que não foi cobrado (404)
+POST {{banco}}/estornos
+Content-Type: application/json
+
+{ "referencia": "nunca-cobrado" }

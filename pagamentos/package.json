@@ -1,0 +1,20 @@
+{
+  "name": "pagamentos",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Serviço de pagamentos do e-commerce: cobra no banco do cartão e participa da saga",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "kafkajs": "^2.2.4",
+    "opossum": "^8.1.4",
+    "pg": "^8.13.1"
+  }
+}

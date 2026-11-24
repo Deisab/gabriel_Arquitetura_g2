@@ -30,6 +30,23 @@ const MODELOS = {
     assunto: `Pedido ${curto(e.pedidoId)} cancelado: sem estoque`,
     texto: `Infelizmente não conseguimos reservar os produtos do seu pedido.\nMotivo: ${e.dados.motivo}\nNada foi cobrado.`,
   }),
+  // "Pedido confirmado" só depois do pagamento aprovado: antes, só "recebemos".
+  'pagamento.aprovado': (e) => ({
+    assunto: `Pagamento aprovado: pedido ${curto(e.pedidoId)} confirmado`,
+    texto: `O pagamento de ${reais(e.dados.valor)} foi aprovado (transação ${e.dados.codigoTransacao}).\nSeu pedido está confirmado.`,
+  }),
+  'pagamento.recusado': (e) => ({
+    assunto: `Pagamento recusado: pedido ${curto(e.pedidoId)} cancelado`,
+    texto: `Não conseguimos cobrar ${reais(e.dados.valor)}.\nMotivo: ${e.dados.motivo}\nO pedido foi cancelado e os produtos voltaram para o estoque. Você pode tentar de novo.`,
+  }),
+  'pagamento.estornado': (e) => ({
+    assunto: `Estorno do pedido ${curto(e.pedidoId)}`,
+    texto: `O valor de ${reais(e.dados.valor)} (transação ${e.dados.codigoTransacao}) foi estornado.\nDependendo do banco, pode levar alguns dias para aparecer no extrato.`,
+  }),
+  'pedido.cancelado': (e) => ({
+    assunto: `Pedido ${curto(e.pedidoId)} cancelado a seu pedido`,
+    texto: 'Seu pedido foi cancelado como você pediu. Se algo já tinha sido cobrado, você recebe outro e-mail com o estorno.',
+  }),
 };
 
 async function enviar(evento) {
@@ -47,4 +64,4 @@ const handlers = Object.fromEntries(Object.keys(MODELOS).map((tipo) => [tipo, en
 
 const smtpOk = () => smtp.verify().then(() => true, () => false);
 
-module.exports = { handlers, smtpOk, TOPICOS_ESCUTADOS: ['pedidos', 'estoque'] };
+module.exports = { handlers, smtpOk, TOPICOS_ESCUTADOS: ['pedidos', 'estoque', 'pagamentos'] };
