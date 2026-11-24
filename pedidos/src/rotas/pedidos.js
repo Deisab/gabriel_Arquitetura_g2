@@ -2,6 +2,7 @@ const express = require('express');
 const { pool } = require('../db');
 const { identificar, UUID } = require('../identidade');
 const { buscarProdutos } = require('../catalogo');
+const { publicar } = require('../kafka');
 const { ErroHttp } = require('../erros');
 const { validarCheckout } = require('../validacao');
 
@@ -11,8 +12,8 @@ const router = express.Router();
 router.use('/pedidos', identificar);
 
 const CANCELAVEIS = ['AGUARDANDO_ESTOQUE', 'AGUARDANDO_PAGAMENTO'];
-const CAMPOS = `id, usuario_id, cliente_email, status, valor_total, endereco_entrega,
-                forma_pagamento, cartao_final, criado_em`;
+const CAMPOS = `id, usuario_id, cliente_email, status, motivo, valor_total, endereco_entrega,
+                forma_pagamento, cartao_final, criado_em, atualizado_em`;
 
 const centavos = (valor) => Math.round(valor * 100);
 
@@ -26,9 +27,11 @@ async function buscarItens(pedidoId) {
 }
 
 // POST /pedidos -> 202: o checkout.
-// 400 dados inválidos ou carrinho vazio · 409 produto indisponível · 503 catálogo fora.
+// 400 dados inválidos ou carrinho vazio · 409 produto indisponível (não existe ou desativado) · 503 catálogo fora.
+// O estoque NÃO é decidido aqui: quem decide é a reserva no catálogo, depois do pedido.criado.
 router.post('/pedidos', async (req, res) => {
   const { enderecoEntrega, formaPagamento, cartaoFinal } = validarCheckout(req.body ?? {});
+  const correlationId = req.get('x-request-id');
 
   const { rows: carrinho } = await pool.query(
     'SELECT produto_id, quantidade FROM carrinho_itens WHERE usuario_id = $1 ORDER BY produto_id',
@@ -36,18 +39,12 @@ router.post('/pedidos', async (req, res) => {
   );
   if (carrinho.length === 0) throw new ErroHttp(400, 'Carrinho vazio. Adicione produtos antes de finalizar.');
 
-  // Chamada síncrona, com timeout: pergunta ao catálogo o preço e o estoque de todos os itens de uma vez.
-  const produtos = await buscarProdutos(carrinho.map((i) => i.produto_id), req.get('x-request-id'));
+  // Chamada síncrona, com timeout: o preço precisa ser o de agora, no checkout.
+  const produtos = await buscarProdutos(carrinho.map((i) => i.produto_id), correlationId);
 
-  const indisponiveis = [];
-  for (const item of carrinho) {
-    const produto = produtos.get(item.produto_id);
-    if (!produto || !produto.ativo) {
-      indisponiveis.push(`produto ${item.produto_id} não está mais à venda`);
-    } else if ((produto.estoque?.disponivel ?? 0) < item.quantidade) {
-      indisponiveis.push(`${produto.nome}: pedido ${item.quantidade}, disponível ${produto.estoque?.disponivel ?? 0}`);
-    }
-  }
+  const indisponiveis = carrinho
+    .filter((item) => !produtos.get(item.produto_id)?.ativo)
+    .map((item) => `produto ${item.produto_id} não está mais à venda`);
   if (indisponiveis.length > 0) throw new ErroHttp(409, 'Produto indisponível.', indisponiveis);
 
   // Preço e nome copiados do catálogo agora: o pedido guarda o histórico.
@@ -58,6 +55,7 @@ router.post('/pedidos', async (req, res) => {
   const totalCentavos = itens.reduce((soma, i) => soma + centavos(i.preco_unitario) * i.quantidade, 0);
 
   const cliente = await pool.connect();
+  let pedido;
   try {
     await cliente.query('BEGIN');
 
@@ -78,7 +76,7 @@ router.post('/pedidos', async (req, res) => {
        RETURNING ${CAMPOS}`,
       [req.usuario.id, req.usuario.email, totalCentavos / 100, enderecoEntrega, formaPagamento, cartaoFinal],
     );
-    const pedido = rows[0];
+    pedido = rows[0];
 
     for (const i of itens) {
       await cliente.query(
@@ -89,16 +87,41 @@ router.post('/pedidos', async (req, res) => {
     }
 
     await cliente.query('COMMIT');
-
-    // 202 e não 201: o pedido foi aceito, mas ainda não terminou (falta reservar o estoque e cobrar).
-    // Hoje ele fica em AGUARDANDO_ESTOQUE; na próxima aula, o Kafka o faz andar.
-    res.status(202).location(`/pedidos/${pedido.id}`).json({ ...pedido, itens });
   } catch (err) {
     await cliente.query('ROLLBACK');
     throw err;
   } finally {
     cliente.release();
   }
+
+  console.log(`[pedidos] pedido criado pedido=${pedido.id} req=${correlationId}`);
+
+  // Publica DEPOIS do COMMIT: nunca anuncie um pedido que pode sumir num rollback.
+  // O evento leva o que os outros precisam: itens para o catálogo, valor e forma para o pagamento,
+  // e-mail para as notificações. O número do cartão não vai: só os 4 últimos dígitos.
+  try {
+    await publicar('pedidos', 'pedido.criado', pedido.id, {
+      usuarioId: pedido.usuario_id,
+      clienteEmail: pedido.cliente_email,
+      valorTotal: pedido.valor_total,
+      formaPagamento: pedido.forma_pagamento,
+      cartaoFinal: pedido.cartao_final,
+      itens: itens.map((i) => ({
+        produtoId: i.produto_id,
+        nome: i.nome_produto,
+        precoUnitario: i.preco_unitario,
+        quantidade: i.quantidade,
+      })),
+    }, correlationId);
+  } catch (err) {
+    // Escrita dupla: o pedido foi gravado, mas o evento não saiu. Fica parado em AGUARDANDO_ESTOQUE.
+    // Resolver isso exige o padrão Outbox (ver "Limitações conhecidas" no README).
+    console.error(`[pedidos] ERRO ao publicar pedido.criado pedido=${pedido.id} req=${correlationId}: ${err.message}`);
+  }
+
+  // 202 e não 201: o pedido foi aceito, mas ainda não terminou (reservar o estoque, cobrar).
+  // O cliente consulta GET /pedidos/:id até ver PAGO ou CANCELADO.
+  res.status(202).location(`/pedidos/${pedido.id}`).json({ ...pedido, itens });
 });
 
 // GET /pedidos -> só os meus, do mais novo para o mais antigo.
@@ -123,16 +146,19 @@ router.get('/pedidos/:id', async (req, res) => {
   res.json({ ...rows[0], itens: await buscarItens(rows[0].id) });
 });
 
-// POST /pedidos/:id/cancelar -> 200; 404 não existe ou não é meu; 409 status não permite.
+// POST /pedidos/:id/cancelar -> 200; 404 não existe ou não é meu; 409 status não permite (PAGO ou CANCELADO).
+// Publica pedido.cancelado: o catálogo devolve o estoque e o pagamentos estorna (ou bloqueia a cobrança futura).
 router.post('/pedidos/:id/cancelar', async (req, res) => {
   if (!UUID.test(req.params.id)) throw new ErroHttp(404, 'Pedido não encontrado.');
+  const correlationId = req.get('x-request-id');
+  const motivo = 'cancelado pelo cliente';
 
   // A condição de status vai junto do UPDATE: dois cancelamentos ao mesmo tempo não brigam.
   const { rows } = await pool.query(
-    `UPDATE pedidos SET status = 'CANCELADO'
+    `UPDATE pedidos SET status = 'CANCELADO', motivo = $4, atualizado_em = now()
      WHERE id = $1 AND usuario_id = $2 AND status = ANY($3)
      RETURNING ${CAMPOS}`,
-    [req.params.id, req.usuario.id, CANCELAVEIS],
+    [req.params.id, req.usuario.id, CANCELAVEIS, motivo],
   );
 
   if (rows.length === 0) {
@@ -144,7 +170,24 @@ router.post('/pedidos/:id/cancelar', async (req, res) => {
     throw new ErroHttp(409, `Pedido com status ${existentes[0].status} não pode ser cancelado.`);
   }
 
-  res.json({ ...rows[0], itens: await buscarItens(rows[0].id) });
+  const pedido = rows[0];
+  const itens = await buscarItens(pedido.id);
+  console.log(`[pedidos] pedido cancelado pelo cliente pedido=${pedido.id} req=${correlationId}`);
+
+  try {
+    await publicar('pedidos', 'pedido.cancelado', pedido.id, {
+      usuarioId: pedido.usuario_id,
+      clienteEmail: pedido.cliente_email,
+      valorTotal: pedido.valor_total,
+      formaPagamento: pedido.forma_pagamento,
+      cartaoFinal: pedido.cartao_final,
+      motivo,
+    }, correlationId);
+  } catch (err) {
+    console.error(`[pedidos] ERRO ao publicar pedido.cancelado pedido=${pedido.id} req=${correlationId}: ${err.message}`);
+  }
+
+  res.json({ ...pedido, itens });
 });
 
 module.exports = router;

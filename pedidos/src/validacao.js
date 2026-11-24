@@ -17,13 +17,13 @@ function falhar(detalhes) {
   if (detalhes.length > 0) throw new ErroHttp(400, 'Dados inválidos.', detalhes);
 }
 
-// POST /carrinho/itens: { produto_id, quantidade }
+// POST /carrinho/itens: { produtoId, quantidade } (aceita também produto_id)
 function validarItem(corpo) {
   const detalhes = [];
-  const produtoId = texto(corpo.produto_id);
+  const produtoId = texto(corpo.produtoId ?? corpo.produto_id);
   const quantidade = corpo.quantidade ?? 1;
 
-  if (!produtoId) detalhes.push('produto_id é obrigatório');
+  if (!produtoId) detalhes.push('produtoId é obrigatório');
   if (!Number.isInteger(quantidade) || quantidade <= 0 || quantidade > 99) {
     detalhes.push('quantidade deve ser um inteiro entre 1 e 99');
   }
@@ -32,29 +32,29 @@ function validarItem(corpo) {
   return { produtoId, quantidade };
 }
 
-// POST /pedidos: { endereco_entrega, forma_pagamento, cartao? }
-// Do cartão, só os 4 últimos dígitos saem daqui. O número inteiro nunca é gravado.
+// POST /pedidos: { enderecoEntrega, formaPagamento, cartao? } (aceita também endereco_entrega e forma_pagamento)
+// Do cartão, só os 4 últimos dígitos saem daqui. O número inteiro nunca é gravado, logado nem publicado.
 function validarCheckout(corpo) {
   const detalhes = [];
-  const endereco = corpo.endereco_entrega;
-  const formaPagamento = texto(corpo.forma_pagamento).toLowerCase();
+  const endereco = corpo.enderecoEntrega ?? corpo.endereco_entrega;
+  const formaPagamento = texto(corpo.formaPagamento ?? corpo.forma_pagamento).toLowerCase();
   let enderecoEntrega;
   let cartaoFinal = null;
 
   if (!ehObjeto(endereco)) {
-    detalhes.push('endereco_entrega é obrigatório (cep, logradouro, numero, cidade, uf)');
+    detalhes.push('enderecoEntrega é obrigatório (cep, logradouro, numero, cidade, uf)');
   } else {
     const cep = texto(endereco.cep);
     const logradouro = texto(endereco.logradouro);
     const cidade = texto(endereco.cidade);
     const uf = texto(endereco.uf).toUpperCase();
 
-    if (!cep) detalhes.push('endereco_entrega.cep é obrigatório');
-    else if (!CEP.test(cep)) detalhes.push('endereco_entrega.cep deve ter 8 dígitos (ex.: 97010-000)');
-    if (!logradouro) detalhes.push('endereco_entrega.logradouro é obrigatório');
-    if (!cidade) detalhes.push('endereco_entrega.cidade é obrigatória');
-    if (!uf) detalhes.push('endereco_entrega.uf é obrigatória');
-    else if (!UF.test(uf)) detalhes.push('endereco_entrega.uf deve ter 2 letras (ex.: RS)');
+    if (!cep) detalhes.push('enderecoEntrega.cep é obrigatório');
+    else if (!CEP.test(cep)) detalhes.push('enderecoEntrega.cep deve ter 8 dígitos (ex.: 97010-000)');
+    if (!logradouro) detalhes.push('enderecoEntrega.logradouro é obrigatório');
+    if (!cidade) detalhes.push('enderecoEntrega.cidade é obrigatória');
+    if (!uf) detalhes.push('enderecoEntrega.uf é obrigatória');
+    else if (!UF.test(uf)) detalhes.push('enderecoEntrega.uf deve ter 2 letras (ex.: RS)');
 
     const digitos = cep.replace('-', '');
     enderecoEntrega = {
@@ -68,7 +68,7 @@ function validarCheckout(corpo) {
   }
 
   if (!FORMAS_PAGAMENTO.includes(formaPagamento)) {
-    detalhes.push(`forma_pagamento deve ser uma de: ${FORMAS_PAGAMENTO.join(', ')}`);
+    detalhes.push(`formaPagamento deve ser uma de: ${FORMAS_PAGAMENTO.join(', ')}`);
   } else if (formaPagamento === 'cartao') {
     const numero = texto(corpo.cartao?.numero).replace(/[\s-]/g, '');
     if (!/^\d{13,19}$/.test(numero)) detalhes.push('cartao.numero deve ter de 13 a 19 dígitos');

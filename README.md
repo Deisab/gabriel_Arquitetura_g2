@@ -3,7 +3,8 @@
 Projeto da disciplina de Arquitetura de Sistemas. Cada aula acrescenta uma peça:
 
 - **parte 1:** usuários e catálogo;
-- **parte 2: API Gateway (Kong) e pedidos** (tag `aula-gateway-pedidos`).
+- **parte 2:** API Gateway (Kong) e pedidos (tag `aula-gateway-pedidos`);
+- **parte 3: Kafka e eventos** (tag `aula-kafka`): o checkout vira evento, o catálogo reserva, as notificações avisam.
 
 ```
                  :8080 (a única porta da API)
@@ -13,6 +14,10 @@ Cliente ──JWT──> gateway (Kong, sem banco, kong/kong.yml)
                    ├──> catalogo :3002 ── Mongo
                    └──> pedidos  :3003 ── Postgres
                                  └──────> catalogo (direto, rede interna, timeout 3 s)
+
+KAFKA (KRaft, tópicos pedidos · estoque, 3 partições cada)
+  pedidos ──pedido.criado──> catalogo (reserva) ──estoque.reservado / estoque.insuficiente──> pedidos
+                        └──> notificacoes ──> Mailpit (e-mails)  <── estoque.insuficiente
 ```
 
 | Serviço    | O que faz                                   | Banco    | Porta |
@@ -20,9 +25,13 @@ Cliente ──JWT──> gateway (Kong, sem banco, kong/kong.yml)
 | `gateway`  | Kong: rotas, JWT, perfis, rate limit, ids   | (nenhum) | **8080 no host** |
 | `usuarios` | cadastro, login (emite o JWT) e endereços   | Postgres | 3001, só na rede interna |
 | `catalogo` | produtos, categorias e estoque              | Mongo    | 3002, só na rede interna |
-| `pedidos`  | carrinho e checkout                         | Postgres | 3003, só na rede interna |
+| `pedidos`  | carrinho e checkout; status por evento      | Postgres | 3003, só na rede interna |
+| `notificacoes` | só escuta eventos e manda e-mail        | (nenhum) | 3004, só o /health, na rede interna |
+| `kafka`    | broker de eventos (KRaft, sem ZooKeeper)    | (log)    | 9092, só na rede interna |
+| `kafka-ui` | painel do Kafka: tópicos, mensagens, lag    | --       | **8090 no host** |
+| `mailpit`  | servidor de e-mail de mentira               | --       | **8025 no host** |
 
-Só o gateway publica porta. Serviços e bancos ficam na rede interna do compose.
+Portas no host: só o gateway (8080, e 8001/8002 do painel em `127.0.0.1`), o Kafka UI (8090) e o Mailpit (8025). Serviços, bancos e o Kafka ficam na rede interna do compose.
 
 ## Como subir
 
@@ -99,6 +108,40 @@ Não há front. As requisições ficam em [`http/`](http/), uma por serviço, **
 - [`http/pedidos.http`](http/pedidos.http): login → carrinho → checkout (202) → consultar o pedido; carrinho vazio, sem estoque, pedido de outro usuário, catálogo fora
 
 No VS Code, instale a extensão **REST Client** e clique em **Send Request** acima de cada requisição. Rode na ordem: os logins guardam o token (`# @name login`) e as próximas requisições o reaproveitam.
+
+## Eventos (Kafka)
+
+O checkout não espera mais ninguém além do preço: grava o pedido em `AGUARDANDO_ESTOQUE`, publica `pedido.criado` **depois do COMMIT** e responde 202. Cada interessado reage (coreografia):
+
+| Evento                 | Tópico    | Publica   | Consome                  | dados |
+|------------------------|-----------|-----------|--------------------------|-------|
+| `pedido.criado`        | `pedidos` | pedidos   | catalogo, notificacoes   | usuarioId, clienteEmail, itens, valorTotal, formaPagamento, cartaoFinal |
+| `estoque.reservado`    | `estoque` | catalogo  | pedidos                  | usuarioId, clienteEmail, itens, valorTotal, formaPagamento, cartaoFinal |
+| `estoque.insuficiente` | `estoque` | catalogo  | pedidos, notificacoes    | motivo, usuarioId, clienteEmail |
+
+- **Envelope** igual em todos ([`kafka.js`](pedidos/src/kafka.js), copiado em cada serviço): `{ id, tipo, pedidoId, ocorridoEm, correlationId, dados }`.
+- **Chave** de toda mensagem = id do pedido: os eventos de um pedido caem na mesma partição, em ordem.
+- **correlationId** = o `X-Request-Id` do Kong. Segue de evento em evento e aparece em toda linha de log (`req=...`).
+- **Tópicos** `pedidos`, `estoque` e `pagamentos`, com 3 partições, criados por quem sobe primeiro (`listTopics` + `createTopics`).
+- **Consumer groups**: um por serviço (`pedidos`, `catalogo`, `notificacoes`). Réplicas do mesmo serviço dividem as partições.
+- **Pelo menos uma vez**: o offset é confirmado depois do handler. Todo handler é idempotente:
+  - catálogo: `reservas.pedidoId` é único; o mesmo `pedido.criado` não reserva duas vezes;
+  - pedidos: filtro de estado (`estoque.reservado` só muda o pedido se ele ainda está em `AGUARDANDO_ESTOQUE`).
+- **Reserva tudo ou nada**: `updateOne` com `estoque.disponivel: { $gte: quantidade }` (dois pedidos ao mesmo tempo não deixam o estoque negativo). Faltou um item: devolve os que já tirou e publica `estoque.insuficiente`. Reservado não é vendido: `disponivel` diminui e `reservado` aumenta.
+- **E-mails** (Mailpit, http://localhost:8025): "Recebemos o seu pedido" (`pedido.criado`) e "cancelado: sem estoque" (`estoque.insuficiente`).
+
+O status do pedido:
+
+```
+AGUARDANDO_ESTOQUE ──estoque.reservado──> AGUARDANDO_PAGAMENTO ──(pagamento: próxima aula)──> PAGO
+        └──────────estoque.insuficiente──> CANCELADO (com o motivo)
+```
+
+Para seguir uma compra pelos logs:
+
+```bash
+docker compose logs -t --no-log-prefix | grep <X-Request-Id da resposta do checkout> | sort
+```
 
 ## O gateway (Kong)
 
@@ -178,7 +221,7 @@ Acabou o catálogo aberto: cliente logado recebe 403 e quem não tem token receb
 | GET    | `/carrinho`                   | logado  | 200 `{ itens, total }` com preços atuais do catálogo (catálogo fora: 200 sem preços, com `aviso`) |
 | POST   | `/carrinho/itens`             | logado  | 201 item adicionado · 400 quantidade inválida · 404 produto não existe · 503 catálogo fora |
 | DELETE | `/carrinho/itens/:produtoId`  | logado  | 204 removido · 404 não está no carrinho |
-| POST   | `/pedidos`                    | logado  | 202 pedido aceito · 400 dados inválidos ou carrinho vazio · 409 produto indisponível · 503 catálogo fora |
+| POST   | `/pedidos`                    | logado  | 202 pedido aceito · 400 dados inválidos ou carrinho vazio · 409 produto não existe ou desativado · 503 catálogo fora |
 | GET    | `/pedidos`                    | logado  | 200 meus pedidos |
 | GET    | `/pedidos/:id`                | logado  | 200 pedido com itens · 404 não existe ou não é meu |
 | POST   | `/pedidos/:id/cancelar`       | logado  | 200 cancelado · 404 · 409 status não permite |
@@ -186,21 +229,21 @@ Acabou o catálogo aberto: cliente logado recebe 403 e quem não tem token receb
 
 No Kong, todas as rotas de `/carrinho` e `/pedidos` são uma route só, com `jwt`.
 
-Corpo do `POST /carrinho/itens`: `{ "produto_id": "<id do catálogo>", "quantidade": 2 }` (quantidade de 1 a 99; adicionar o mesmo produto de novo soma).
+Corpo do `POST /carrinho/itens`: `{ "produtoId": "<id do catálogo>", "quantidade": 2 }` (quantidade de 1 a 99; adicionar o mesmo produto de novo soma; `produto_id` também é aceito).
 
 Corpo do checkout (`POST /pedidos`):
 
 ```json
 {
-  "endereco_entrega": { "cep": "97010-000", "logradouro": "Rua do Acampamento", "numero": "100", "cidade": "Santa Maria", "uf": "RS" },
-  "forma_pagamento": "cartao",
+  "enderecoEntrega": { "cep": "97010-000", "logradouro": "Rua do Acampamento", "numero": "100", "cidade": "Santa Maria", "uf": "RS" },
+  "formaPagamento": "cartao",
   "cartao": { "numero": "4111 1111 1111 1111" }
 }
 ```
 
-`forma_pagamento`: `cartao`, `pix` ou `boleto`. Do cartão, só os 4 últimos dígitos são gravados.
+`formaPagamento`: `cartao`, `pix` ou `boleto`. Do cartão, só os 4 últimos dígitos são gravados (e só eles vão no evento). Os nomes em snake_case (`endereco_entrega`, `forma_pagamento`) também são aceitos.
 
-O pedido nasce em `AGUARDANDO_ESTOQUE` (202 e não 201: foi aceito, mas ainda não terminou). Os outros estados (`AGUARDANDO_PAGAMENTO`, `PAGO`, `CANCELADO`) já existem na tabela; quem fará o pedido andar é o Kafka, na próxima aula. Cancelar só é possível em `AGUARDANDO_ESTOQUE` ou `AGUARDANDO_PAGAMENTO`.
+O pedido nasce em `AGUARDANDO_ESTOQUE` (202 e não 201: foi aceito, mas ainda não terminou) e anda sozinho pelos eventos (seção **Eventos**). O estoque não é decidido no checkout: quem decide é a reserva no catálogo. Sem estoque, o checkout ainda responde 202 e o pedido vira `CANCELADO` com o `motivo`. Cancelar só é possível em `AGUARDANDO_ESTOQUE` ou `AGUARDANDO_PAGAMENTO`.
 
 ### Formato de erro (todos os serviços)
 
@@ -226,12 +269,18 @@ O pedido nasce em `AGUARDANDO_ESTOQUE` (202 e não 201: foi aceito, mas ainda n�
 ├── catalogo/
 │   ├── seeds/
 │   └── src/
-└── pedidos/
-    ├── migrations/         # carrinho_itens, pedidos, itens_pedido
+├── pedidos/
+│   ├── migrations/         # carrinho_itens, pedidos, itens_pedido; 002: motivo
+│   └── src/
+│       ├── catalogo.js     # cliente HTTP do catálogo (timeout de 3 s)
+│       ├── eventos.js      # reações a estoque.* (filtro de estado)
+│       ├── identidade.js   # lê X-User-* do gateway
+│       └── kafka.js        # envelope, publicar, consumir (igual em todos os serviços)
+└── notificacoes/           # sem banco, sem rota no Kong: escuta e manda e-mail
     └── src/
-        ├── catalogo.js     # cliente HTTP do catálogo (timeout de 3 s)
-        └── identidade.js   # lê X-User-* do gateway
 ```
+
+O catálogo ganhou `src/estoque.js` (reserva) e a coleção `reservas`.
 
 Cada serviço é independente: tem o próprio `package.json`, `Dockerfile` e banco, e nenhum importa código do outro. Por isso `erros.js` aparece duplicado nos serviços, e é de propósito.
 
@@ -285,9 +334,22 @@ Cada serviço é independente: tem o próprio `package.json`, `Dockerfile` e ban
 
 **Contexto.** No checkout o pedidos precisa do preço e do estoque atuais de cada produto.
 **Decisão.** Chamada HTTP síncrona `GET http://catalogo:3002/produtos?ids=a,b,c` pela rede interna, sem passar pelo gateway, uma só para o carrinho inteiro, com timeout de 3 s e repassando o `X-Request-Id`.
-**Consequência.** Acoplamento temporal: com o catálogo fora ou lento, o checkout responde 503 em até 3 s em vez de travar. Carrinho e lista de pedidos continuam funcionando. Na próxima aula, o Kafka tira esse acoplamento da reserva de estoque.
+**Consequência.** Acoplamento temporal: com o catálogo fora ou lento, o checkout responde 503 em até 3 s em vez de travar. Carrinho e lista de pedidos continuam funcionando. Desde a aula de Kafka, só o preço é síncrono; a reserva do estoque é por evento (ADR-011).
 
 ### ADR-010: o pedido copia preço, nome e endereço
 
 **Decisão.** `itens_pedido` guarda `nome_produto` e `preco_unitario`; `pedidos` guarda `endereco_entrega` (JSONB) e só os 4 últimos dígitos do cartão. Não há FK para usuários nem produtos: eles moram em outros bancos.
 **Consequência.** Se o produto mudar de preço amanhã, o pedido de hoje não muda: não é duplicação, é histórico. Quem garante que o produto existe é o código, perguntando ao catálogo.
+
+### ADR-011: Kafka e coreografia para o que pode esperar
+
+**Contexto.** Checkout que chama catálogo, pagamento e e-mail em corrente: cada serviço a mais multiplica a chance de falhar e soma latência.
+**Decisão.** Kafka (um broker KRaft) com eventos no passado (`pedido.criado`, `estoque.reservado`), chave = id do pedido, um consumer group por serviço e coreografia: ninguém manda, cada um reage. O preço continua síncrono, porque precisa ser o de agora.
+**Consequência.** Catálogo ou notificações fora do ar não impedem a venda: os eventos esperam no tópico. Em troca: consistência eventual (o pedido fica alguns instantes em `AGUARDANDO_ESTOQUE`), entrega pelo menos uma vez (todo handler idempotente) e o fluxo inteiro só aparece somando os serviços.
+
+## Limitações conhecidas
+
+- **Escrita dupla:** o pedido é gravado e o evento publicado depois do COMMIT. Se o Kafka cair entre os dois, o pedido fica parado em `AGUARDANDO_ESTOQUE`. A solução é o padrão Outbox (gravar o evento numa tabela na mesma transação e publicar depois), que não foi feito.
+- **Sem DLQ:** um handler que falha é tentado 5 vezes com espera crescente; depois disso o erro é logado e o offset avança. Um tópico de erros (DLQ) para reprocessar fica para depois.
+- **Um broker só, fator 1:** ótimo para aprender, inaceitável em produção.
+- **E-mail repetido:** como a entrega é pelo menos uma vez, um evento reprocessado pode mandar o mesmo e-mail duas vezes.

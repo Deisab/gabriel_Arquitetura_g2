@@ -1,6 +1,8 @@
 # Serviço de pedidos (carrinho e checkout), sempre pelo gateway (Kong). Rode na ordem.
 # Todas as rotas são "logado": o Kong exige o token (jwt) e entrega ao serviço X-User-Id, X-User-Email e X-User-Role.
 # Fluxo: login -> adicionar ao carrinho -> ver carrinho -> checkout (202) -> consultar o pedido.
+# Desde a aula de Kafka o pedido anda sozinho: pedido.criado -> o catálogo reserva -> estoque.reservado ou
+# estoque.insuficiente -> o pedido muda de status. Kafka UI: http://localhost:8090 · Mailpit: http://localhost:8025
 
 @baseUrl = http://localhost:8080
 
@@ -44,8 +46,8 @@ Authorization: Bearer {{login.response.body.$.token}}
 Content-Type: application/json
 
 {
-  "endereco_entrega": { "cep": "97010-000", "logradouro": "Rua do Acampamento", "numero": "100", "cidade": "Santa Maria", "uf": "RS" },
-  "forma_pagamento": "pix"
+  "enderecoEntrega": { "cep": "97010-000", "logradouro": "Rua do Acampamento", "numero": "100", "cidade": "Santa Maria", "uf": "RS" },
+  "formaPagamento": "pix"
 }
 
 ### Adicionar ao carrinho (201) - o pedidos pergunta ao catálogo se o produto existe
@@ -53,35 +55,35 @@ POST {{baseUrl}}/carrinho/itens
 Authorization: Bearer {{login.response.body.$.token}}
 Content-Type: application/json
 
-{ "produto_id": "{{livros.response.body.$[0].id}}", "quantidade": 2 }
+{ "produtoId": "{{livros.response.body.$[0].id}}", "quantidade": 2 }
 
 ### Adicionar o mesmo produto de novo (201) - soma: quantidade vira 3
 POST {{baseUrl}}/carrinho/itens
 Authorization: Bearer {{login.response.body.$.token}}
 Content-Type: application/json
 
-{ "produto_id": "{{livros.response.body.$[0].id}}", "quantidade": 1 }
+{ "produtoId": "{{livros.response.body.$[0].id}}", "quantidade": 1 }
 
 ### Adicionar outro produto (201)
 POST {{baseUrl}}/carrinho/itens
 Authorization: Bearer {{login.response.body.$.token}}
 Content-Type: application/json
 
-{ "produto_id": "{{livros.response.body.$[1].id}}", "quantidade": 1 }
+{ "produtoId": "{{livros.response.body.$[1].id}}", "quantidade": 1 }
 
 ### 400 - quantidade inválida
 POST {{baseUrl}}/carrinho/itens
 Authorization: Bearer {{login.response.body.$.token}}
 Content-Type: application/json
 
-{ "produto_id": "{{livros.response.body.$[0].id}}", "quantidade": 0 }
+{ "produtoId": "{{livros.response.body.$[0].id}}", "quantidade": 0 }
 
 ### 404 - produto que não existe no catálogo
 POST {{baseUrl}}/carrinho/itens
 Authorization: Bearer {{login.response.body.$.token}}
 Content-Type: application/json
 
-{ "produto_id": "000000000000000000000000", "quantidade": 1 }
+{ "produtoId": "000000000000000000000000", "quantidade": 1 }
 
 ### Ver carrinho (200) - { itens, total } com os preços atuais do catálogo
 GET {{baseUrl}}/carrinho
@@ -95,31 +97,35 @@ Authorization: Bearer {{login.response.body.$.token}}
 DELETE {{baseUrl}}/carrinho/itens/{{livros.response.body.$[1].id}}
 Authorization: Bearer {{login.response.body.$.token}}
 
-# ---------- produto indisponível (409) ----------
+# ---------- sem estoque: o checkout aceita (202) e a reserva no catálogo recusa ----------
+# O checkout não decide o estoque: quem decide é a reserva no catálogo (tudo ou nada, $gte no Mongo).
 
 ### Busca o Smartphone Fold (só 2 em estoque no seed) - guarda em "fold"
 # @name fold
 GET {{baseUrl}}/produtos?busca=fold
 
-### Coloca 5 Folds no carrinho (201) - o carrinho aceita; quem confere o estoque é o checkout
+### Coloca 3 Folds no carrinho (201) - junto com os 3 livros que já estão lá
 POST {{baseUrl}}/carrinho/itens
 Authorization: Bearer {{login.response.body.$.token}}
 Content-Type: application/json
 
-{ "produto_id": "{{fold.response.body.$[0].id}}", "quantidade": 5 }
+{ "produtoId": "{{fold.response.body.$[0].id}}", "quantidade": 3 }
 
-### 409 - checkout com produto sem estoque suficiente (detalhes diz qual)
+### Checkout sem estoque (202, AGUARDANDO_ESTOQUE) - guarda em "semEstoque"
+# @name semEstoque
 POST {{baseUrl}}/pedidos
 Authorization: Bearer {{login.response.body.$.token}}
 Content-Type: application/json
 
 {
-  "endereco_entrega": { "cep": "97010-000", "logradouro": "Rua do Acampamento", "numero": "100", "cidade": "Santa Maria", "uf": "RS" },
-  "forma_pagamento": "pix"
+  "enderecoEntrega": { "cep": "97010-000", "logradouro": "Rua do Acampamento", "numero": "100", "cidade": "Santa Maria", "uf": "RS" },
+  "formaPagamento": "pix"
 }
 
-### Tira o Fold do carrinho (204)
-DELETE {{baseUrl}}/carrinho/itens/{{fold.response.body.$[0].id}}
+### Reenvie até mudar: CANCELADO, com motivo "estoque insuficiente: Smartphone Fold (pedido 3)"
+# Tudo ou nada: o livro chegou a ser reservado, mas voltou ao disponível quando faltou o Fold.
+# No Mailpit: "Recebemos o seu pedido" e "cancelado: sem estoque".
+GET {{baseUrl}}/pedidos/{{semEstoque.response.body.$.id}}
 Authorization: Bearer {{login.response.body.$.token}}
 
 # ---------- checkout ----------
@@ -129,19 +135,33 @@ POST {{baseUrl}}/pedidos
 Authorization: Bearer {{login.response.body.$.token}}
 Content-Type: application/json
 
-{ "forma_pagamento": "cartao", "cartao": { "numero": "1234" } }
+{ "formaPagamento": "cartao", "cartao": { "numero": "1234" } }
 
-### Checkout (202) - pedido aceito em AGUARDANDO_ESTOQUE; do cartão só ficam os 4 últimos dígitos
+### Livro de volta ao carrinho para o caminho feliz (201) - o checkout anterior esvaziou o carrinho
+POST {{baseUrl}}/carrinho/itens
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{ "produtoId": "{{livros.response.body.$[0].id}}", "quantidade": 2 }
+
+### Checkout - caminho feliz (202) - nasce em AGUARDANDO_ESTOQUE; do cartão só ficam os 4 últimos dígitos
 # @name pedido
 POST {{baseUrl}}/pedidos
 Authorization: Bearer {{login.response.body.$.token}}
 Content-Type: application/json
 
 {
-  "endereco_entrega": { "cep": "97010-000", "logradouro": "Rua do Acampamento", "numero": "100", "cidade": "Santa Maria", "uf": "RS" },
-  "forma_pagamento": "cartao",
+  "enderecoEntrega": { "cep": "97010-000", "logradouro": "Rua do Acampamento", "numero": "100", "cidade": "Santa Maria", "uf": "RS" },
+  "formaPagamento": "cartao",
   "cartao": { "numero": "4111 1111 1111 1111" }
 }
+
+### Reenvie até mudar: AGUARDANDO_PAGAMENTO (o catálogo reservou o estoque e publicou estoque.reservado)
+GET {{baseUrl}}/pedidos/{{pedido.response.body.$.id}}
+Authorization: Bearer {{login.response.body.$.token}}
+
+### O estoque do livro: disponivel diminuiu e reservado aumentou
+GET {{baseUrl}}/produtos/{{livros.response.body.$[0].id}}
 
 ### Carrinho depois do checkout (200, vazio)
 GET {{baseUrl}}/carrinho
@@ -151,7 +171,7 @@ Authorization: Bearer {{login.response.body.$.token}}
 GET {{baseUrl}}/pedidos
 Authorization: Bearer {{login.response.body.$.token}}
 
-### Consultar o pedido (200) - com itens, preço e nome copiados do catálogo na hora da compra
+### Consultar o pedido com itens (200) - preço e nome copiados do catálogo na hora da compra
 GET {{baseUrl}}/pedidos/{{pedido.response.body.$.id}}
 Authorization: Bearer {{login.response.body.$.token}}
 
@@ -189,7 +209,7 @@ POST {{baseUrl}}/carrinho/itens
 Authorization: Bearer {{login.response.body.$.token}}
 Content-Type: application/json
 
-{ "produto_id": "{{livros.response.body.$[0].id}}", "quantidade": 1 }
+{ "produtoId": "{{livros.response.body.$[0].id}}", "quantidade": 1 }
 
 ### 503 - checkout com o catálogo parado
 POST {{baseUrl}}/pedidos
@@ -197,8 +217,8 @@ Authorization: Bearer {{login.response.body.$.token}}
 Content-Type: application/json
 
 {
-  "endereco_entrega": { "cep": "97010-000", "logradouro": "Rua do Acampamento", "numero": "100", "cidade": "Santa Maria", "uf": "RS" },
-  "forma_pagamento": "boleto"
+  "enderecoEntrega": { "cep": "97010-000", "logradouro": "Rua do Acampamento", "numero": "100", "cidade": "Santa Maria", "uf": "RS" },
+  "formaPagamento": "boleto"
 }
 
 ### Carrinho com o catálogo parado (200, sem preços e com "aviso")

@@ -33,11 +33,14 @@ async function criarIndices() {
     { key: { categoria: 1 }, name: 'categoria' },
   ]);
   await db.collection('categorias').createIndex({ slug: 1 }, { name: 'slug_unico', unique: true });
+  // Idempotência da reserva: o mesmo pedido.criado entregue duas vezes não reserva duas vezes.
+  await db.collection('reservas').createIndex({ pedidoId: 1 }, { name: 'pedido_unico', unique: true });
 }
 
 const produtos = () => db.collection('produtos');
 const categorias = () => db.collection('categorias');
+const reservas = () => db.collection('reservas');
 const ping = () => db.command({ ping: 1 });
 const fechar = () => cliente.close();
 
-module.exports = { conectar, produtos, categorias, ping, fechar };
+module.exports = { conectar, produtos, categorias, reservas, ping, fechar };
