@@ -197,6 +197,8 @@ AGUARDANDO_ESTOQUE ──estoque.reservado──> AGUARDANDO_PAGAMENTO ──pag
 
 Cada seta só vale a partir do estado de origem: um evento repetido ou atrasado não leva o pedido para trás. `CANCELADO` sempre grava o `motivo`.
 
+Entre tópicos diferentes o Kafka não garante ordem: sob carga, o `pagamento.aprovado` (tópico `pagamentos`) pode chegar ao pedidos antes do `estoque.reservado` (tópico `estoque`) do mesmo pedido. Por isso `PAGO` vale a partir de `AGUARDANDO_ESTOQUE` ou `AGUARDANDO_PAGAMENTO` (só existe pagamento depois de a reserva dar certo), e o `estoque.reservado` atrasado é ignorado. O teste de carga encontrou esse caso.
+
 ### A saga
 
 | Passo | Serviço | Compensação | Disparada por |
@@ -236,6 +238,45 @@ O login aceita 10 tentativas por minuto por IP: rodando vários arquivos seguido
 | Cache | `GET /produtos` duas vezes; admin muda o preço | `X-Cache: MISS`, depois `HIT`; após a escrita, `MISS` com o preço novo |
 | Redis fora | `docker compose stop redis` | a vitrine responde com `X-Cache: OFF`; `/health/catalogo` `degradado` (200) |
 | Banco de um serviço fora | `docker compose stop pagamentos-db` | `/health/pagamentos` 503; em uns 30 s `docker compose ps` mostra `(unhealthy)`; volta sozinho ao subir o banco |
+
+## Testes automatizados
+
+Além dos `.http` (manuais), a pasta [`testes/`](testes/) tem uma suíte automática que testa o sistema **de fora, pelo gateway**, como um cliente de verdade. Ela usa o executor de testes do próprio Node (`node:test`, equivalente ao pytest) e não precisa instalar nada. Com o sistema no ar:
+
+```bash
+cd testes
+node rodar.js
+```
+
+O executor espera o sistema ficar pronto e roda os arquivos em ordem, um por vez (os de infraestrutura param e religam containers). Para rodar só alguns, use `node rodar.js 04 05`.
+
+| Arquivo | O que verifica |
+|---------|----------------|
+| `01-gateway` | health pelo Kong; `X-Request-Id`; 401 (sem token, token falso, assinatura falsa, perfil inexistente); `X-User-*` de fora apagado; 403 de admin; 404 do Kong; o JWT (HS256, sub, perfil, 2 h); só as portas combinadas publicadas |
+| `02-usuarios` | login (mesmo 401 para senha errada e e-mail inexistente), cadastro (perfil sempre cliente, 409, 400, JSON quebrado), `/me`, endereços (404 para o endereço de outra pessoa), lista de admin sem `senha_hash`, formato de erro |
+| `03-catalogo` | vitrine, filtros, busca, 404; CRUD de admin com 409 e 400; PUT não mexe no estoque; PATCH nunca negativo; DELETE desativa; **cache** MISS → HIT → invalidação na escrita |
+| `04-pedidos` | carrinho, checkout 202 → `PAGO`, preço do momento do checkout, sem estoque → `CANCELADO` (tudo ou nada), produto desativado 409, pedido de outra pessoa 404, cancelar `PAGO` 409, e-mails no Mailpit |
+| `05-saga` | banco-falso (402, idempotência da referência, estorno); pagamento APROVADO; cartão 0002 com estoque devolvido; cancelar no meio da cobrança → `ESTORNADO`; 30% de falha → retry; 100% → circuito abre, `degradado`, e fecha sozinho; latência 3 s → timeout, 3 tentativas |
+| `06-kafka` | envelope, chave = id do pedido, mesmo `correlationId` = `X-Request-Id`, cartão fora do evento; **reentrega** de `pedido.criado` e `estoque.reservado` sem reservar nem cobrar de novo; **eventos fora de ordem** entre tópicos; um grep mostra a compra em 4 serviços; nada sensível nos logs; lag zero |
+| `07-infra` | todos `(healthy)`; Redis fora → `X-Cache: OFF` e `degradado`; catálogo fora → checkout 503 em ~3 s; banco do pagamentos fora → 503 e `unhealthy`, e volta sozinho; notificações fora → a loja vende e os e-mails saem quando ela volta |
+| `08-rate-limit` | 10 logins por minuto por IP, depois 429 |
+
+**Teste de carga** (pequeno, para ver o sistema sob concorrência):
+
+```bash
+node carga.js
+```
+
+Ele faz 2.000 leituras da vitrine com 50 ao mesmo tempo, 60 compras em paralelo (6 clientes) e uma disputa de 36 pedidos por 20 unidades, e no fim confere o lag do Kafka e o health. Resultado numa máquina de desenvolvimento:
+
+| Cenário | Resultado |
+|---------|-----------|
+| Vitrine (2.000 GETs, 50 simultâneos) | ~580 req/s, p50 27 ms, p95 40 ms, 0 erros, 99% `X-Cache: HIT` |
+| 60 compras em paralelo | todas `PAGO`; checkout p95 62 ms; saga inteira (checkout → `PAGO`) p50 ~3,5 s; 60 pagamentos, nenhum duplicado; estoque exato |
+| 36 pedidos por 20 unidades | exatamente 20 `PAGO` e 16 `CANCELADO` (estoque insuficiente); estoque final 0, nunca negativo |
+| Depois | lag do Kafka zero; todos os serviços `ok` |
+
+O teste de carga encontrou um defeito real: sob concorrência, o `pagamento.aprovado` chegava antes do `estoque.reservado` (tópicos diferentes não têm ordem entre si) e o pedido ficava preso em `AGUARDANDO_PAGAMENTO`. A correção está na seção **Eventos**, e o `06-kafka` tem um teste que reproduz o caso.
 
 ## Observabilidade
 
@@ -279,6 +320,7 @@ No compose, todo serviço tem `healthcheck` (`wget` no `/health`, a cada 10 s, 3
 ├── kong/kong.yml             # gateway declarativo: services, routes, consumers, plugins
 ├── http/                     # requisições para o REST Client, todas pelo gateway
 ├── docs/adr/                 # decisões de arquitetura, uma por arquivo
+├── testes/                   # testes automatizados (node rodar.js) e de carga (node carga.js)
 ├── usuarios/                 # Postgres · migrations/ · seeds/ · src/
 ├── catalogo/                 # Mongo + Redis · src/estoque.js (reserva e compensações) · src/cache.js
 ├── pedidos/                  # Postgres · src/eventos.js (status por evento) · src/catalogo.js (HTTP, timeout)
