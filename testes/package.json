@@ -1,0 +1,13 @@
+{
+  "name": "testes",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Testes automatizados do e-commerce, de ponta a ponta pelo gateway (sem dependências: node:test)",
+  "scripts": {
+    "test": "node rodar.js",
+    "carga": "node carga.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
