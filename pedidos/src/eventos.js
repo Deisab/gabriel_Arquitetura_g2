@@ -19,7 +19,10 @@ async function mudarStatus(evento, novo, de, motivo = null) {
 const handlers = {
   'estoque.reservado': (e) => mudarStatus(e, 'AGUARDANDO_PAGAMENTO', ['AGUARDANDO_ESTOQUE']),
   'estoque.insuficiente': (e) => mudarStatus(e, 'CANCELADO', ['AGUARDANDO_ESTOQUE'], e.dados?.motivo || 'estoque insuficiente'),
-  'pagamento.aprovado': (e) => mudarStatus(e, 'PAGO', ['AGUARDANDO_PAGAMENTO']),
+  // Entre tópicos não há ordem: sob carga, o pagamento.aprovado (tópico pagamentos) pode chegar ANTES do
+  // estoque.reservado (tópico estoque) do mesmo pedido. Como só existe pagamento depois de a reserva dar certo,
+  // PAGO também vale a partir de AGUARDANDO_ESTOQUE; o estoque.reservado atrasado encontra PAGO e é ignorado.
+  'pagamento.aprovado': (e) => mudarStatus(e, 'PAGO', ['AGUARDANDO_ESTOQUE', 'AGUARDANDO_PAGAMENTO']),
   // Compensação: pagamento recusado (ou banco fora) cancela o pedido, com o motivo.
   'pagamento.recusado': (e) => mudarStatus(e, 'CANCELADO', ['AGUARDANDO_ESTOQUE', 'AGUARDANDO_PAGAMENTO'], e.dados?.motivo || 'pagamento recusado'),
 };
