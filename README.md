@@ -2,27 +2,147 @@
 
 Projeto da disciplina de Arquitetura de Sistemas (Prof. Augusto Gehrke): uma loja com cinco serviços, quatro bancos, um broker de eventos, um API Gateway e um banco de cartão externo de mentira. Uma compra passa por quase todos.
 
-## Subir
+## Subir o projeto: passo a passo
 
-Pré-requisito: Docker com Docker Compose. Num clone novo, **um comando**:
+Resumo para quem já tem tudo instalado: `git clone`, entrar na pasta, `docker compose up -d --build`, e rodar [`http/fluxo-completo.http`](http/fluxo-completo.http). Abaixo, cada passo em detalhe.
+
+### 1. Instalar o que precisa
+
+| Programa | Para quê | Obrigatório? |
+|----------|----------|--------------|
+| **Docker Desktop** (Windows/Mac) ou Docker Engine + Docker Compose v2 (Linux) | sobe todo o sistema | **sim** |
+| **Git** | baixar o repositório | sim (ou baixe o ZIP pelo GitHub) |
+| **VS Code** + extensão **REST Client** (autor: Huachao Mao) | rodar os arquivos `.http` | para testar a API |
+| **Node.js 20+** | só para a suíte automática e o teste de carga (`testes/`) | não |
+
+O Docker precisa de memória: são 15 containers (Kafka, Kong, 4 bancos, Redis...). Reserve pelo menos **6 GB de RAM** para o Docker (Docker Desktop → Settings → Resources). No Windows, o Docker Desktop usa o WSL 2, que ele mesmo instala.
+
+### 2. Baixar o projeto
+
+```bash
+git clone https://github.com/Deisab/gabriel_Arquitetura_g2.git
+```
+
+```bash
+cd gabriel_Arquitetura_g2
+```
+
+Para baixar exatamente a versão entregue (a tag `entrega-final`), use `git clone --branch entrega-final https://github.com/Deisab/gabriel_Arquitetura_g2.git`. Sem Git: no GitHub, **Code → Download ZIP**, extraia e abra um terminal dentro da pasta extraída.
+
+Nenhum arquivo precisa ser criado ou editado: não há `.env` obrigatório, todas as variáveis têm valor padrão no `docker-compose.yml`.
+
+### 3. Abrir o Docker e conferir que ele está de pé
+
+Abra o **Docker Desktop** e espere aparecer "Engine running" no canto inferior esquerdo. Depois, no terminal:
+
+```bash
+docker compose version
+```
+
+Deve mostrar a versão (v2 ou mais nova). Se aparecer erro de conexão ("cannot connect", "500 Internal Server Error"), o Docker ainda não terminou de subir ou travou: feche e abra o Docker Desktop de novo.
+
+### 4. Liberar as portas
+
+O projeto publica estas portas no seu computador: **8080, 8001, 8002, 8090, 8025 e 9000**. Se outro projeto do Docker estiver usando alguma delas (por exemplo, a docker-class das aulas, que usa 8000–8002 e 8090), pare esse projeto antes: no Docker Desktop, **Containers → ■ Stop** na linha dele. Para ver o que está rodando:
+
+```bash
+docker ps
+```
+
+### 5. Subir tudo
+
+Dentro da pasta do projeto:
 
 ```bash
 docker compose up -d --build
 ```
 
-Sobe tudo: serviços, bancos, Kafka, Kong, Redis, Mailpit e banco-falso. Migrations, seeds e tópicos se criam sozinhos (o sistema sobe com dados), e o gateway só sobe depois que os serviços estão healthy: quando o comando termina, a loja já vende. Para conferir:
+Na **primeira vez** leva de 3 a 10 minutos, porque baixa as imagens (Kafka, Kong, Postgres, Mongo, Redis...) e monta a imagem de cada serviço. Nas próximas, menos de 1 minuto.
+
+O que acontece sozinho, sem nenhum passo manual:
+
+1. bancos, Kafka, Redis e Mailpit sobem e ficam saudáveis;
+2. cada serviço espera o seu banco e o Kafka, aplica as migrations, roda o seed (usuários e produtos) e cria os tópicos do Kafka;
+3. o gateway (Kong) só sobe depois que os serviços estão saudáveis.
+
+Quando o comando terminar, a loja já está vendendo.
+
+### 6. Conferir que está tudo de pé
 
 ```bash
 docker compose ps
 ```
 
-Todos aparecem `(healthy)`. Depois, abra [`http/fluxo-completo.http`](http/fluxo-completo.http) e rode de cima para baixo (VS Code + extensão **REST Client**, "Send Request"): login, carrinho, checkout e o pedido chegando a `PAGO`, sem editar nada.
+Os **15 containers** devem aparecer como `(healthy)`. Se algum ainda mostrar `(health: starting)`, espere uns segundos e rode de novo. No navegador, estes endereços devem responder `"status": "ok"`:
 
-Para derrubar e **apagar os dados** (o seed roda de novo na próxima subida):
+- http://localhost:8080/health/usuarios
+- http://localhost:8080/health/catalogo
+- http://localhost:8080/health/pedidos
+- http://localhost:8080/health/pagamentos
+
+### 7. Fazer uma compra (o teste principal)
+
+1. Abra a pasta do projeto no VS Code (**File → Open Folder**).
+2. Instale a extensão **REST Client** (Extensões, `Ctrl+Shift+X`, busque "REST Client", autor Huachao Mao).
+3. Abra [`http/fluxo-completo.http`](http/fluxo-completo.http).
+4. Clique em **Send Request** (aparece em cima de cada requisição), **uma por vez, de cima para baixo**. A resposta abre à direita.
+5. No passo **5** ("Reenvie até mudar"), clique de novo até o status virar `PAGO` (1 ou 2 segundos).
+
+Não é preciso editar nada: o token e os ids passam de uma requisição para a outra sozinhos (`# @name`). Por isso a ordem importa. Os outros arquivos da pasta [`http/`](http/) e os cenários de falha estão na seção **Demonstração**.
+
+### 8. Ver o sistema por dentro
+
+| Onde | O que mostra |
+|------|--------------|
+| http://localhost:8025 | **Mailpit**: os e-mails da compra ("Recebemos o seu pedido", "Pagamento aprovado"...) |
+| http://localhost:8090 | **Kafka UI**: em Topics, os eventos de `pedidos`, `estoque` e `pagamentos`; em Consumers, o lag |
+| http://localhost:9000/config | **banco-falso**: a latência e a taxa de falha atuais |
+| http://localhost:8002 | **Kong Manager**: as rotas e plugins carregados |
+
+Logs ao vivo dos serviços:
 
 ```bash
-docker compose down -v
+docker compose logs -f pedidos catalogo pagamentos notificacoes
 ```
+
+### 9. Rodar os testes automatizados (opcional, precisa do Node)
+
+Com o sistema no ar, numa segunda janela do terminal:
+
+```bash
+cd testes
+```
+
+```bash
+node rodar.js
+```
+
+Leva uns 3 minutos e termina com `8/8 arquivos passaram`. O teste de carga: `node carga.js`. Detalhes na seção **Testes automatizados**.
+
+### 10. Parar, religar e recomeçar do zero
+
+| Para... | Comando |
+|---------|---------|
+| parar tudo, mantendo os dados | `docker compose stop` |
+| religar depois de parar | `docker compose start` |
+| desligar e remover os containers, mantendo os dados | `docker compose down` |
+| **apagar tudo e recomeçar com os dados do seed** | `docker compose down -v` e depois `docker compose up -d --build` |
+| aplicar uma mudança no código de um serviço | `docker compose up -d --build <servico>` (ex.: `pedidos`) |
+| aplicar uma mudança no `kong/kong.yml` | `docker compose restart gateway` |
+
+### 11. Se algo der errado
+
+| Sintoma | O que fazer |
+|---------|-------------|
+| `Bind for 0.0.0.0:8090 failed: port is already allocated` (ou outra porta) | outro programa usa a porta: pare o outro projeto no Docker Desktop (passo 4) e rode `docker compose up -d` de novo |
+| `cannot connect to the Docker daemon` ou `500 Internal Server Error` | o Docker não está de pé: abra (ou feche e abra) o Docker Desktop e espere "Engine running" |
+| No VS Code: "The connection was rejected" | o sistema não está no ar: rode `docker compose up -d` e confira com `docker compose ps` |
+| `502` ou `503` logo depois de subir | algum serviço ainda está subindo: espere todos ficarem `(healthy)` |
+| `429 API rate limit exceeded` no login | o login aceita 10 tentativas por minuto: espere 1 minuto |
+| Um container `(unhealthy)` ou reiniciando | veja o motivo com `docker compose logs <servico>` (ex.: `docker compose logs pagamentos`) |
+| Pedido parado em `AGUARDANDO_*` | confira se o banco-falso está normal: rode "Sem latência e sem falhas" em [`http/demos.http`](http/demos.http) |
+| Comportamento estranho depois de muitos testes | recomece do zero: `docker compose down -v` e `docker compose up -d --build` |
+| Lento ou containers caindo sem motivo | pouca memória para o Docker: aumente para 6 GB ou mais (passo 1) |
 
 ### Portas
 
